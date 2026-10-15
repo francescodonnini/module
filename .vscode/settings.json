@@ -1,6 +1,5 @@
 {
     "[c]":   { "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd", "editor.formatOnSave": true },
-    "[cpp]": { "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd", "editor.formatOnSave": true },
     "C_Cpp.errorSquiggles": "enabled",
     "C_Cpp.intelliSenseEngine": "disabled",
     "clangd.arguments": [
@@ -9,7 +8,6 @@
         "--completion-style=detailed",
         "--query-driver=/usr/bin/gcc"
     ],
-    "cmake.ignoreCMakeListsMissing": true,
     "files.associations": {
         "*.h": "c",
         "Kbuild": "makefile",
