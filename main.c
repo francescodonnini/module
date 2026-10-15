@@ -18,10 +18,15 @@ static int __init runtime_init(void)
 	if (resolve_symbols() < 0)
 		return -1;
 
+	err = sa_init();
+	if (err)
+		return err;
+
 	debug_init();
 	err = chrdev_init();
-	if (err)
+	if (err) {
 		debug_exit();
+	}
 
 	return err;
 }

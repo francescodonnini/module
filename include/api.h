@@ -31,13 +31,41 @@ struct sa_allocator_desc {
 	struct kref kref;
 };
 
+static unsigned long stack_size;
+static unsigned long area_size;
+static unsigned long user_stack_start;
+static unsigned long user_stack_end;
+static unsigned long shadow_stack_start;
+static unsigned long shadow_stack_end;
+static unsigned long offset;
+
+static long sa_init(void)
+{
+	if (shadow_stack_start <= user_stack_start)
+		return -EINVAL;
+
+	if (shadow_stack_start <= TASK_SIZE)
+		return -EINVAL;
+
+	if (user_stack_start >= TASK_SIZE)
+		return -EINVAL;
+
+	user_stack_end = user_stack_start + area_size;
+	if (user_stack_end >= TASK_SIZE)
+		return -EINVAL;
+
+	shadow_stack_end = shadow_stack_start + area_size;
+	offset = shadow_stack_start - user_stack_start;
+	return 0;
+}
+
 struct sa_allocator_desc *alloc_create(pid_t tgid, struct mm_struct *mm);
 
 void alloc_destroy(struct sa_allocator_desc *alloc);
 
-long sa_alloc(uint64_t *vaddr);
+long sa_alloc(uint64_t stack_base);
 
-long sa_free_kernel_stack(uint64_t addr);
+long sa_free(void);
 
 long sa_fork(pid_t p_tgid, pid_t p_pid);
 

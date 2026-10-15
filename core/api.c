@@ -15,8 +15,6 @@
 #include <linux/version.h>
 #include <linux/vmalloc.h>
 
-#define addr_to_id(addr) ((u32)((addr - SS_START) / SS_SIZE))
-#define id_to_addr(id) (SS_START + (u64)(id) * SS_SIZE)
 #define GL_SA_CAPACITY (128)
 
 struct sa_pagelist {
@@ -27,7 +25,8 @@ struct sa_pagelist {
 
 struct sa_thread_desc {
 	pid_t tid;
-	uint64_t addr;
+	uint64_t shadow_stack_base;
+	uint64_t stack_base;
 	struct sa_pagelist *pagelist;
 };
 
@@ -590,66 +589,83 @@ static inline void atomic64_max(atomic64_t *curr, s64 id)
 	}
 }
 
+static inline unsigned long user_to_shadow(unsigned long base)
+{
+	return base + offset;
+}
+
+static bool valid_stack_base(unsigned long base)
+{
+	unsigned long shadow;
+
+	if (!IS_ALIGNED(base, stack_size))
+		return false;
+
+	if (base < user_stack_start || base >= user_stack_end)
+		return false;
+
+	shadow = user_to_shadow(base);
+	return shadow >= shadow_stack_start &&
+	       shadow + stack_size <= shadow_stack_end;
+}
+
 /**
- * sa_alloc - Creates a new shadow area mapping for the current calling thread. The user-space virtual address is saved to `addr`.
- * @addr: if all goes well, it will contain the logical address of the shadow stack.
+ * sa_alloc - Creates a new shadow area mapping for the current calling thread.
+ * @addr: address of the user space stack
  *
  * Context: Process context.
  * Returns 0 on success, < 0 otherwise.
  */
-long sa_alloc(uint64_t addr)
+long sa_alloc(uint64_t stack_base)
 {
 	struct mm_struct *mm;
 	struct sa_allocator_desc *alloc;
 	struct sa_thread_desc *thread;
-	u32 id;
 	long err;
 
 	mm = current->mm;
 	if (!mm)
 		return -EINVAL;
 
+	if (!valid_stack_base(stack_base))
+		return -EINVAL;
+
 	alloc = alloc_get(current->tgid);
 	if (!alloc)
 		return -ENOMEM;
 
-	err = xa_alloc(&alloc->threads, &id, NULL, XA_LIMIT(0, THREADS_LIMIT),
-		       GFP_KERNEL);
-	if (err)
-		goto err_put;
-
 	thread = kmalloc_obj(*thread, GFP_KERNEL);
 	if (!thread) {
 		err = -ENOMEM;
-		goto err_erase;
+		goto err_put;
 	}
 
 	err = gl_alloc_stack(&thread->pagelist);
 	if (err)
 		goto err_thread;
 
-	*addr = id_to_addr(id);
 	thread->tid = current->pid;
-	thread->addr = id_to_addr(id);
-	mmap_write_lock(mm);
-	err = map_range(mm, thread->addr, thread->addr + SS_SIZE,
-			thread->pagelist);
-	mmap_write_unlock(mm);
-	my_flush_tlb_mm(mm);
+	thread->stack_base = stack_base;
+	thread->shadow_stack_base = user_to_shadow(stack_base);
+	err = xa_insert(&alloc->threads, thread->tid, thread, GFP_KERNEL);
 	if (err)
 		goto err_stack;
 
-	atomic64_max(&alloc->max_id, id);
-	xa_store(&alloc->threads, id, thread, GFP_KERNEL);
-	*addr = thread->addr;
-	return err;
+	mmap_write_lock(mm);
+	err = map_range(mm, thread->shadow_stack_base,
+			thread->shadow_stack_base + SS_SIZE, thread->pagelist);
+	mmap_write_unlock(mm);
+	if (err)
+		goto err_erase;
 
+	return 0;
+
+err_erase:
+	xa_erase(&alloc->threads, thread->tid);
 err_stack:
 	gl_free(thread->pagelist);
 err_thread:
 	kfree(thread);
-err_erase:
-	xa_erase(&alloc->threads, id);
 err_put:
 	alloc_put(alloc);
 	return err;
@@ -666,19 +682,17 @@ err_put:
 long sa_fork(pid_t parent_tgid, pid_t parent_pid)
 {
 	struct mm_struct *mm;
-	struct sa_allocator_desc *child, *parent;
-	struct sa_thread_desc *thread, *t;
-	struct sa_pagelist *stack;
-	unsigned long id, index;
-	bool found;
+	struct sa_allocator_desc *alloc, *parent;
+	struct sa_thread_desc *thread, *pt;
+	int i;
 	long err;
 
 	mm = current->mm;
 	if (!mm)
 		return -EINVAL;
 
-	child = alloc_get(current->tgid);
-	if (!child)
+	alloc = alloc_get(current->tgid);
+	if (!alloc)
 		return -ENOMEM;
 
 	// No ref-count because the parent thread is blocked in fork() until this function returns,
@@ -689,65 +703,50 @@ long sa_fork(pid_t parent_tgid, pid_t parent_pid)
 		goto err_put;
 	}
 
+	pt = xa_load(&parent->threads, parent_pid);
+	if (!pt) {
+		err = -ENOENT;
+		goto err_put;
+	}
+
 	thread = kmalloc_obj(*thread, GFP_KERNEL);
 	if (!thread) {
 		err = -ENOMEM;
 		goto err_put;
 	}
 
-	err = gl_alloc_stack(&stack);
+	err = gl_alloc_stack(&thread->pagelist);
 	if (err)
 		goto err_thread;
 
-	found = false;
-	id = 0;
-	down_read(&parent->al_lock);
-	xa_for_each(&parent->threads, index, t) {
-		int i;
-
-		if (t->tid != parent_pid)
-			continue;
-
-		for (i = 0; i < t->pagelist->nr_pages; ++i)
-			copy_highpage(stack->pages[i], t->pagelist->pages[i]);
-
-		id = index;
-		found = true;
-		break;
-	}
-
-	up_read(&parent->al_lock);
-	if (!found) {
-		err = -ENOENT;
-		goto err_stack;
-	}
+	for (i = 0; i < pt->pagelist->nr_pages; ++i)
+		copy_highpage(thread->pagelist->pages[i],
+			      pt->pagelist->pages[i]);
 
 	thread->tid = current->pid;
-	thread->addr = id_to_addr(id);
-	thread->pagelist = stack;
-	err = xa_insert(&child->threads, id, thread, GFP_KERNEL);
+	thread->shadow_stack_base = pt->shadow_stack_base;
+	err = xa_insert(&alloc->threads, thread->tid, thread, GFP_KERNEL);
 	if (err)
 		goto err_stack;
 
 	mmap_write_lock(mm);
-	err = map_range(mm, thread->addr, thread->addr + SS_SIZE,
+	err = map_range(mm, thread->shadow_stack_base,
+			thread->shadow_stack_base + stack_size,
 			thread->pagelist);
 	mmap_write_unlock(mm);
-	my_flush_tlb_mm(mm);
 	if (err)
 		goto err_erase;
 
-	atomic64_max(&child->max_id, id);
 	return 0;
 
 err_erase:
-	xa_erase(&child->threads, id);
+	xa_erase(&alloc->threads, thread->tid);
 err_stack:
-	gl_free(stack);
+	gl_free(thread->pagelist);
 err_thread:
 	kfree(thread);
 err_put:
-	alloc_put(child);
+	alloc_put(alloc);
 	return err;
 }
 
@@ -763,35 +762,28 @@ err_put:
  * Context: Process context.
  * Returns 0 on success, <0 otherwise.
  */
-long sa_free(uint64_t addr)
+long sa_free(void)
 {
 	struct mm_struct *mm;
 	struct sa_allocator_desc *alloc;
-	u32 id;
 	struct sa_thread_desc *t;
 
 	mm = current->mm;
 	if (!mm)
 		return -EINVAL;
 
-	if (addr < SS_START || addr >= SS_END || (addr - SS_START) % SS_SIZE)
-		return -EINVAL;
-
 	alloc = alloc_find(current->tgid);
 	if (!alloc)
 		return -EINVAL;
 
-	id = addr_to_id(addr);
-	down_write(&alloc->al_lock);
-	t = xa_erase(&alloc->threads, id);
-	up_write(&alloc->al_lock);
+	t = xa_erase(&alloc->threads, current->pid);
 	if (!t)
 		return -EINVAL;
 
 	mmap_write_lock(mm);
 	// only ptes are cleared because other threads might be using upper level tables and wasted
 	// space isn't too much anyway
-	unmap_range(mm, addr, addr + SS_SIZE);
+	unmap_range(mm, t->shadow_stack_base, t->shadow_stack_base + SS_SIZE);
 	mmap_write_unlock(mm);
 	gl_free(t->pagelist);
 	kfree(t);
@@ -799,46 +791,81 @@ long sa_free(uint64_t addr)
 	return 0;
 }
 
+/**
+ * sa_pivot - Moves the user stack of the calling process from the original region to the one
+ * located in `new_stack_address`, and creates the corresponding allocator and thread objects.
+ * @rsp: stack pointer of the calling thread (it's needed to locate the vma of the stack area)
+ * @new_stack_address: address of the new stack area
+ *
+ * Returns 0 on success, <0 otherwise
+ */
 long sa_pivot(uint64_t rsp, uint64_t new_stack_address)
 {
 	struct mm_struct *mm;
-	struct vm_area_struct *old_stack_area;
-	struct vm_area_struct *new_stack_area;
-	unsigned long old_stck_start;
-	size_t old_stck_len;
-	unsigned long new_stck_start;
+	struct sa_allocator_desc *alloc;
+	struct sa_thread_desc *thread;
+	long err;
+	struct vm_area_struct *old_area;
+	struct vm_area_struct *new_area;
+	unsigned long old_start;
+	size_t old_len;
+	unsigned long new_start;
 	long delta;
 	int i;
-	long err;
 
 	mm = current->mm;
 	if (!mm)
 		return -EINVAL;
 
-	err = -1;
+	alloc = alloc_get(current->tgid);
+	if (!alloc)
+		return -ENOENT;
+
+	thread = kmalloc_obj(*thread, GFP_KERNEL);
+	if (!thread) {
+		err = -ENOMEM;
+		goto err_put;
+	}
+
+	err = gl_alloc_stack(&thread->pagelist);
+	if (err)
+		goto err_thread;
+
+	thread->tid = current->pid;
 	mmap_write_lock(mm);
-	old_stack_area = find_vma(mm, rsp);
-	if (!old_stack_area || old_stack_area->vm_start > rsp) {
+	old_area = find_vma(mm, rsp);
+	if (!old_area || old_area->vm_start > rsp) {
 		err = -EINVAL;
-		goto out;
+		goto err_unlock;
 	}
 
-	old_stck_start = old_stack_area->vm_start;
-	old_stck_len = old_stack_area->vm_end - old_stack_area->vm_start;
-	pr_info("old stack: [%lx - %lx)", old_stck_start,
-		old_stck_start + old_stck_len);
-	new_stack_area = find_vma(mm, new_stack_address);
-	if (!new_stack_area || new_stack_area->vm_start > new_stack_address) {
+	new_area = find_vma(mm, new_stack_address);
+	if (!new_area || new_area->vm_start > new_stack_address) {
 		err = -EINVAL;
-		goto out;
+		goto err_unlock;
 	}
 
-	new_stck_start = new_stack_area->vm_start;
+	old_start = old_area->vm_start;
+	old_len = old_area->vm_end - old_area->vm_start;
+	new_start = new_area->vm_start;
+	thread->stack_base = new_start;
+	thread->shadow_stack_base = user_to_shadow(new_start);
+	err = map_range(mm, thread->shadow_stack_base,
+			thread->shadow_stack_base + stack_size,
+			thread->pagelist);
+	if (err)
+		goto err_unlock;
+
+	err = xa_insert(&alloc->threads, thread->tid, thread, GFP_KERNEL);
+	if (err) {
+		unmap_range(mm, thread->shadow_stack_base,
+			    thread->shadow_stack_base + stack_size);
+		goto err_unlock;
+	}
+
 	delta = new_stack_address - rsp;
-	pr_info("new stack start: %lx", new_stck_start);
-	pr_info("delta: %ld", delta);
 	spin_lock(&mm->arg_lock);
-	mm->start_stack = new_stck_start;
+	mm->start_stack = new_start;
 	mm->arg_start += delta;
 	mm->arg_end += delta;
 	mm->env_start += delta;
@@ -857,16 +884,20 @@ long sa_pivot(uint64_t rsp, uint64_t new_stack_address)
 	}
 
 	spin_unlock(&mm->arg_lock);
-	vm_flags_clear(old_stack_area, VM_GROWSDOWN);
-	vm_flags_set(new_stack_area, VM_GROWSDOWN);
+	vm_flags_clear(old_area, VM_GROWSDOWN);
+	vm_flags_set(new_area, VM_GROWSDOWN);
+	mmap_write_unlock(mm);
+	vm_munmap(old_area->vm_start, old_area->vm_end - old_area->vm_start);
 
-	sa_alloc(uint64_t *addr)
+	return err;
 
-		out : mmap_write_unlock(mm);
-
-	vm_munmap(old_stack_area->vm_start,
-		  old_stack_area->vm_end - old_stack_area->vm_start);
-
+err_unlock:
+	mmap_write_unlock(mm);
+	gl_free(thread->pagelist);
+err_thread:
+	kfree(thread);
+err_put:
+	alloc_put(alloc);
 	return err;
 }
 

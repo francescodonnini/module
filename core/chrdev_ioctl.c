@@ -48,26 +48,24 @@ long chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 	switch (cmd) {
 	case IOCTL_SHADOW_REQ: {
-		struct ioctl_mem_params req;
-		unsigned long long addr;
+		struct ioctl_alloc_params req;
 
 		if (copy_from_user(&req, user_arg, sizeof(req)))
 			return -EFAULT;
 
-		req.error = sa_alloc(&addr);
-		req.addr = addr;
+		req.error = sa_alloc(req.stack_base);
 		if (copy_to_user(user_arg, &req, sizeof(req)))
 			return -EFAULT;
 
 		break;
 	}
 	case IOCTL_SHADOW_FREE: {
-		struct ioctl_mem_params req;
+		struct ioctl_free_params req;
 
 		if (copy_from_user(&req, user_arg, sizeof(req)))
 			return -EFAULT;
 
-		req.error = sa_free_kernel_stack(req.addr);
+		req.error = sa_free();
 		if (copy_to_user(user_arg, &req, sizeof(req)))
 			return -EFAULT;
 
