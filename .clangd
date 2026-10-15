@@ -1,0 +1,21 @@
+CompileFlags:
+  Remove:
+    - -fasan-shadow-offset=*
+    - -fconserve-stack
+    - -fdiagnostics-show-context=*
+    - -fmin-function-alignment=*
+    - -fno-allow-store-data-races
+    - -fno-ipa-sra
+    - -fno-var-tracking-assignments
+    - -fsanitize=bounds-strict
+    - -fzero-call-used-regs=*
+    - -fzero-init-padding-bits=*
+    - -mrecord-mcount
+    - -mindirect-branch-register
+    - -mindirect-branch=*
+    - -mfunction-return=*
+    - -mpreferred-stack-boundary=*
+    - -mskip-rax-setup
+  Add:
+    - -Wno-unknown-warning-option
+    - -Wno-unused-command-line-argument
