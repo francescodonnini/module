@@ -652,6 +652,9 @@ long sa_detach(u64 stack_base)
 	if (!alloc)
 		return -EINVAL;
 
+	if (stack_base == alloc->main.stack_base)
+		return 0;
+
 	xa_lock(&alloc->threads);
 	t = xa_load(&alloc->threads, sa_stack_index(stack_base));
 	if (t)
