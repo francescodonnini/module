@@ -646,14 +646,13 @@ static void detach_by_sp(struct sa_allocator_desc *alloc, unsigned long sp)
 		return;
 
 	base = user_stack_start + sa_stack_index(sp) * stack_size;
-	if (alloc->main.state == SA_OWNED && base == alloc->main.stack_base) {
-		WARN_ONCE(1, "detaching main thread\n");
+	if (base == alloc->main.stack_base) {
 		return;
 	}
 
 	xa_lock(&alloc->threads);
 	t = xa_load(&alloc->threads, sa_stack_index(base));
-	if (t && t->state == SA_OWNED)
+	if (t)
 		t->detached = true;
 
 	xa_unlock(&alloc->threads);
