@@ -1,75 +1,73 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef LKM_API_H
 #define LKM_API_H
-#include <linux/atomic.h>
 #include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/mm_types.h>
+#include <linux/mmu_notifier.h>
 #include <linux/rwsem.h>
 #include <linux/sched/mm.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/xarray.h>
 
-/// WARNING: These two shouldn't be hard-coded but determined at runtime (probably should be kernel module variables)
-#define SS_START (0xffffeb0000000000ULL)
-#define SS_END (0xfffffc0000000000ULL)
-#define SS_SIZE (8 * 1024 * 1024)
-#define THREADS_LIMIT ((SS_END - SS_START) / SS_SIZE)
-
-/// "Shadow area" allocator descriptor
-/// It's a bump arena allocator where `free_area` is the address of the next memory area it can be used
-/// as a shadow stack area. An allocator is associated to a group of threads sharing the same thread group id.
-/// When a thread exits, its former shadow area is added to a free_list so it might be used by another thread.
-/// `kref` keeps track of how many threads might be using the allocator.
-struct sa_allocator_desc {
-	pid_t tgid;
-	struct mm_struct *mm;
-	struct rw_semaphore al_lock;
-	struct xarray threads;
-	atomic64_t max_id;
-	struct kref kref;
+enum sa_thread_state {
+	SA_OWNED,
+	SA_PREPARED,
 };
 
-static unsigned long stack_size;
-static unsigned long area_size;
-static unsigned long user_stack_start;
-static unsigned long user_stack_end;
-static unsigned long shadow_stack_start;
-static unsigned long shadow_stack_end;
-static unsigned long offset;
+struct sa_pagelist {
+	int nr_pages;
+	struct page **pages;
+	struct list_head list; // gl_sa
+};
 
-static long sa_init(void)
-{
-	if (shadow_stack_start <= user_stack_start)
-		return -EINVAL;
+struct sa_thread_desc {
+	uint64_t stack_base;
+	enum sa_thread_state state;
+	bool detached;
+	struct pid *owner;
+	struct sa_pagelist *pagelist;
+	struct list_head list;
+};
 
-	if (shadow_stack_start <= TASK_SIZE)
-		return -EINVAL;
+struct sa_allocator_desc {
+	struct mm_struct *mm;
+	spinlock_t lock;
+	struct xarray threads;
+	struct sa_thread_desc main;
+	struct mmu_notifier mn;
+};
 
-	if (user_stack_start >= TASK_SIZE)
-		return -EINVAL;
+extern unsigned long stack_size;
+extern unsigned long area_size;
+extern unsigned long user_stack_start;
+extern unsigned long user_stack_end;
+extern unsigned long shadow_stack_start;
+extern unsigned long shadow_stack_end;
+extern unsigned long sa_offset;
 
-	user_stack_end = user_stack_start + area_size;
-	if (user_stack_end >= TASK_SIZE)
-		return -EINVAL;
+long sa_init(void);
 
-	shadow_stack_end = shadow_stack_start + area_size;
-	offset = shadow_stack_start - user_stack_start;
-	return 0;
-}
-
-struct sa_allocator_desc *alloc_create(pid_t tgid, struct mm_struct *mm);
+struct sa_allocator_desc *alloc_create(struct mm_struct *mm);
 
 void alloc_destroy(struct sa_allocator_desc *alloc);
 
 long sa_alloc(uint64_t stack_base);
 
-long sa_free(void);
+long sa_fork(void);
 
-long sa_fork(pid_t p_tgid, pid_t p_pid);
+long sa_mark_exiting(void);
 
 long sa_pivot(uint64_t rsp, uint64_t new_stack_address);
+
+long sa_prepare(uint64_t stack_base, bool detached);
+
+long sa_reclaim(uint64_t stack_base);
+
+long sa_reclaim_dead(u64 __user *reclaimed, unsigned cap);
+
+long sa_unprepare(unsigned long stack_base);
 
 long resolve_symbols(void);
 

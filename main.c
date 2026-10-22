@@ -35,6 +35,7 @@ static void __exit runtime_exit(void)
 {
 	debug_exit();
 	chrdev_cleanup();
+	mmu_notifier_synchronize();
 	vma_free();
 }
 

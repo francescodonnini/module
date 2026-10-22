@@ -99,4 +99,10 @@ static inline void tlb_free_pte(struct sa_tlb *tlb, pgtable_t pte,
 	tlb->clear_pmds = true;
 	sa_tlb_add(tlb, pte);
 }
+
+static inline void tlb_free_p4d(struct sa_tlb *tlb, p4d_t *p4d,
+				unsigned long addr)
+{
+	tlb_adjust_range(tlb, addr, PAGE_SIZE);
+}
 #endif

@@ -10,6 +10,16 @@
 #define COMPAT_MAX_ORDER MAX_PAGE_ORDER
 #endif
 
+#ifndef kmalloc_array
+#define kmalloc_array(n, size, flags)                              \
+	({                                                         \
+		size_t bytes;                                      \
+		if (unlikely(check_mul_overflow(n, size, &bytes))) \
+			return NULL;                               \
+		return kmalloc(bytes, flags);                      \
+	})
+#endif
+
 #ifndef kmalloc_obj
 #define kmalloc_obj(VAR_OR_TYPE, gfp)                                  \
 	({                                                             \
@@ -17,6 +27,15 @@
 		kmalloc(__obj_size, gfp);                              \
 	})
 #endif
+
+#ifndef kzalloc_obj
+#define kzalloc_obj(VAR_OR_TYPE, gfp)                                  \
+	({                                                             \
+		const size_t __obj_size = sizeof(typeof(VAR_OR_TYPE)); \
+		kzalloc(__obj_size, gfp);                              \
+	})
+#endif
+
 /*
  * Da 6.14 alloc_pages_bulk_array() è stata rinominata alloc_pages_bulk().
  */
