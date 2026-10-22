@@ -1035,7 +1035,9 @@ long sa_reclaim(uint64_t stack_base)
 		err = -EINVAL;
 	} else if (!owner_gone(t->owner)) {
 		err = -EAGAIN;
-	} else if (!t->detached) {
+	} else if (t->detached) {
+		err = -EINVAL;
+	} else {
 		__xa_erase(&alloc->threads, index);
 		list_add(&t->list, &dead);
 	}
