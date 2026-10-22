@@ -24,8 +24,8 @@
 #define IOCTL_SHADOW_RECLAIM                               \
 	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_RECLAIM_NO, \
 	      struct ioctl_reclaim_params)
-#define IOCTL_SHADOW_RECLAIM_DEAD                          \
-	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_RECLAIM_NO, \
+#define IOCTL_SHADOW_RECLAIM_DEAD                               \
+	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_RECLAIM_DEAD_NO, \
 	      struct ioctl_reclaim_dead_params)
 #define IOCTL_SHADOW_UNPREPARE                               \
 	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_UNPREPARE_NO, \
