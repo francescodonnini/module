@@ -12,14 +12,14 @@
 #define IOCTL_SHADOW_FORK                               \
 	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_FORK_NO, \
 	      struct ioctl_fork_params)
-#define IOCTL_SHADOW_FREE                               \
-	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_FREE_NO, \
-	      struct ioctl_free_params)
+#define IOCTL_SHADOW_DETACH                               \
+	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_DETACH_NO, \
+	      struct ioctl_detach_params)
 #define IOCTL_SHADOW_PIVOT                               \
 	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_PIVOT_NO, \
 	      struct ioctl_pivot_params)
-#define IOCTL_SHADOW_PREPARE                                \
-	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_PREAPARE_NO, \
+#define IOCTL_SHADOW_PREPARE                               \
+	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_PREPARE_NO, \
 	      struct ioctl_prepare_params)
 #define IOCTL_SHADOW_RECLAIM                               \
 	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_RECLAIM_NO, \
@@ -34,7 +34,7 @@
 enum {
 	IOCTL_SHADOW_ALLOC_NO = 0x70,
 	IOCTL_SHADOW_FORK_NO,
-	IOCTL_SHADOW_FREE_NO,
+	IOCTL_SHADOW_DETACH_NO,
 	IOCTL_SHADOW_PIVOT_NO,
 	IOCTL_SHADOW_PREPARE_NO,
 	IOCTL_SHADOW_RECLAIM_NO,
@@ -45,44 +45,45 @@ enum {
 
 struct ioctl_alloc_params {
 	long error;
-	unsigned long stack_base;
+	u64 stack_base;
+};
+
+struct ioctl_detach_params {
+	long error;
+	u64 stack_base;
 };
 
 struct ioctl_fork_params {
 	long error;
-	int p_tgid;
-	int p_pid;
-};
-
-struct ioctl_free_params {
-	long error;
+	u64 stack_base;
 };
 
 struct ioctl_pivot_params {
 	long error;
-	unsigned long new_stack_address;
-	unsigned long rsp;
+	u64 new_stack_address;
+	u64 rsp;
 };
 
 struct ioctl_prepare_params {
 	long error;
-	unsigned long stack_base;
+	u64 stack_base;
+	bool detached;
 };
 
 struct ioctl_reclaim_params {
 	long error;
-	unsigned long stack_base;
+	u64 stack_base;
 };
 
 struct ioctl_reclaim_dead_params {
 	long error;
-	__u64 bases;
-	__u32 cap;
-	__u32 count;
+	u64 bases;
+	u32 cap;
+	u32 count;
 };
 
 struct ioctl_unprepare_params {
 	long error;
-	unsigned long stack_base;
+	u64 stack_base;
 };
 #endif

@@ -441,6 +441,7 @@ static inline void unmap_range(struct mm_struct *mm, uint64_t addr,
 
 		unmap_p4d_range(mm, pgd, addr, next);
 	} while (pgd++, addr = next, addr != end);
+
 	__flush_tlb_mm_range_bnd(mm, start, end, PAGE_SHIFT, false);
 }
 
@@ -636,13 +637,52 @@ static struct sa_thread_desc *desc_by_sp(struct sa_allocator_desc *alloc,
 	return xa_load(&alloc->threads, sa_stack_index(base));
 }
 
+static void detach_by_sp(struct sa_allocator_desc *alloc, unsigned long sp)
+{
+	unsigned long base;
+	struct sa_thread_desc *t;
+
+	if (sp < user_stack_start || sp >= user_stack_end)
+		return;
+
+	base = user_stack_start + sa_stack_index(sp) * stack_size;
+	if (alloc->main.state == SA_OWNED && base == alloc->main.stack_base) {
+		WARN_ONCE(1, "detaching main thread\n");
+		return;
+	}
+
+	xa_lock(&alloc->threads);
+	t = xa_load(&alloc->threads, sa_stack_index(base));
+	if (t && t->state == SA_OWNED)
+		t->detached = true;
+
+	xa_unlock(&alloc->threads);
+}
+
+long sa_detach(u64 stack_base)
+{
+	struct mm_struct *mm;
+	struct sa_allocator_desc *alloc;
+
+	mm = current->mm;
+	if (!mm || !valid_stack_base(stack_base))
+		return -EINVAL;
+
+	alloc = alloc_find(mm);
+	if (!alloc)
+		return -EINVAL;
+
+	detach_by_sp(alloc, stack_base);
+	return 0;
+}
+
 /**
  * sa_fork - Creates a new shadow area mapping for the current calling thread by duplicating the parent thread's shadow stack.
  *
  * Context: Process context, it issues a TLB shootdown for the current process.
  * Returns 0 on success, <0 otherwise.
  */
-long sa_fork(void)
+long sa_fork(uint64_t *stack_base)
 {
 	struct task_struct *parent;
 	struct mm_struct *mm, *parent_mm;
@@ -704,6 +744,7 @@ long sa_fork(void)
 
 	t->owner = get_pid(task_pid(current));
 	t->state = SA_OWNED;
+	*stack_base = t->stack_base;
 	mmput(parent_mm);
 	return 0;
 
@@ -1058,7 +1099,7 @@ long sa_reclaim_dead(u64 __user *reclaimed, unsigned cap)
 	return ret;
 }
 
-long sa_unprepare(unsigned long stack_base)
+long sa_unprepare(u64 stack_base)
 {
 	struct mm_struct *mm;
 	struct sa_allocator_desc *alloc;

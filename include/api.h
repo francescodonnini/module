@@ -53,21 +53,21 @@ struct sa_allocator_desc *alloc_create(struct mm_struct *mm);
 
 void alloc_destroy(struct sa_allocator_desc *alloc);
 
-long sa_alloc(uint64_t stack_base);
+long sa_alloc(u64 stack_base);
 
-long sa_fork(void);
+long sa_detach(u64 stack_base);
 
-long sa_mark_exiting(void);
+long sa_fork(u64 *stack_base);
 
-long sa_pivot(uint64_t rsp, uint64_t new_stack_address);
+long sa_pivot(u64 rsp, u64 new_stack_address);
 
-long sa_prepare(uint64_t stack_base, bool detached);
+long sa_prepare(u64 stack_base, bool detached);
 
-long sa_reclaim(uint64_t stack_base);
+long sa_reclaim(u64 stack_base);
 
 long sa_reclaim_dead(u64 __user *reclaimed, unsigned cap);
 
-long sa_unprepare(unsigned long stack_base);
+long sa_unprepare(u64 stack_base);
 
 long resolve_symbols(void);
 

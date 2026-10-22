@@ -65,7 +65,19 @@ long chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (copy_from_user(&req, user_arg, sizeof(req)))
 			return -EFAULT;
 
-		req.error = sa_fork();
+		req.error = sa_fork(&req.stack_base);
+		if (copy_to_user(user_arg, &req, sizeof(req)))
+			return -EFAULT;
+
+		break;
+	}
+	case IOCTL_SHADOW_DETACH: {
+		struct ioctl_detach_params req;
+
+		if (copy_from_user(&req, user_arg, sizeof(req)))
+			return -EFAULT;
+
+		req.error = sa_detach(req.stack_base);
 		if (copy_to_user(user_arg, &req, sizeof(req)))
 			return -EFAULT;
 
@@ -78,6 +90,18 @@ long chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 
 		req.error = sa_pivot(req.rsp, req.new_stack_address);
+		if (copy_to_user(user_arg, &req, sizeof(req)))
+			return -EFAULT;
+
+		break;
+	}
+	case IOCTL_SHADOW_PREPARE: {
+		struct ioctl_prepare_params req;
+
+		if (copy_from_user(&req, user_arg, sizeof(req)))
+			return -EFAULT;
+
+		req.error = sa_prepare(req.stack_base, req.detached);
 		if (copy_to_user(user_arg, &req, sizeof(req)))
 			return -EFAULT;
 
