@@ -637,31 +637,12 @@ static struct sa_thread_desc *desc_by_sp(struct sa_allocator_desc *alloc,
 	return xa_load(&alloc->threads, sa_stack_index(base));
 }
 
-static void detach_by_sp(struct sa_allocator_desc *alloc, unsigned long sp)
-{
-	unsigned long base;
-	struct sa_thread_desc *t;
-
-	if (sp < user_stack_start || sp >= user_stack_end)
-		return;
-
-	base = user_stack_start + sa_stack_index(sp) * stack_size;
-	if (base == alloc->main.stack_base) {
-		return;
-	}
-
-	xa_lock(&alloc->threads);
-	t = xa_load(&alloc->threads, sa_stack_index(base));
-	if (t)
-		t->detached = true;
-
-	xa_unlock(&alloc->threads);
-}
-
 long sa_detach(u64 stack_base)
 {
 	struct mm_struct *mm;
 	struct sa_allocator_desc *alloc;
+	struct sa_thread_desc *t;
+	long err = 0;
 
 	mm = current->mm;
 	if (!mm || !valid_stack_base(stack_base))
@@ -671,8 +652,15 @@ long sa_detach(u64 stack_base)
 	if (!alloc)
 		return -EINVAL;
 
-	detach_by_sp(alloc, stack_base);
-	return 0;
+	xa_lock(&alloc->threads);
+	t = xa_load(&alloc->threads, sa_stack_index(stack_base));
+	if (t)
+		t->detached = true;
+	else
+		err = -EINVAL;
+
+	xa_unlock(&alloc->threads);
+	return err;
 }
 
 /**
@@ -914,15 +902,15 @@ long sa_prepare(uint64_t stack_base, bool detached)
 		return -EINVAL;
 
 	if (stack_base == alloc->main.stack_base) {
-		WARN_ONCE(1, "shadowstack: prepare on main's stack\n");
+		pr_warn_ratelimited("shadowstack: prepare on main's stack\n");
 		return -EBUSY;
 	}
 
 	id = sa_stack_index(stack_base);
 	err = xa_insert(&alloc->threads, id, NULL, GFP_KERNEL);
 	if (err == -EBUSY) {
-		WARN_ONCE(1, "shadowstack: stack slot %lu already in use\n",
-			  id);
+		pr_warn_ratelimited(
+			"shadowstack: stack slot %lu already in use\n", id);
 		return err;
 	}
 
@@ -1033,10 +1021,10 @@ long sa_reclaim(uint64_t stack_base)
 	t = xa_load(&alloc->threads, index);
 	if (!t || t->state != SA_OWNED) {
 		err = -EINVAL;
-	} else if (!owner_gone(t->owner)) {
-		err = -EAGAIN;
 	} else if (t->detached) {
 		err = -EINVAL;
+	} else if (!owner_gone(t->owner)) {
+		err = -EAGAIN;
 	} else {
 		__xa_erase(&alloc->threads, index);
 		list_add(&t->list, &dead);
