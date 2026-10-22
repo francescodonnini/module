@@ -1,11 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef LKM_API_H
 #define LKM_API_H
-#include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/mm_types.h>
 #include <linux/mmu_notifier.h>
-#include <linux/rwsem.h>
 #include <linux/sched/mm.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
@@ -33,7 +31,6 @@ struct sa_thread_desc {
 
 struct sa_allocator_desc {
 	struct mm_struct *mm;
-	spinlock_t lock;
 	struct xarray threads;
 	struct sa_thread_desc main;
 	struct mmu_notifier mn;
@@ -50,8 +47,6 @@ extern unsigned long sa_offset;
 long sa_init(void);
 
 struct sa_allocator_desc *alloc_create(struct mm_struct *mm);
-
-void alloc_destroy(struct sa_allocator_desc *alloc);
 
 long sa_alloc(u64 stack_base);
 
