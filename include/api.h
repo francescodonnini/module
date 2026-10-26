@@ -36,14 +36,6 @@ struct sa_allocator_desc {
 	struct mmu_notifier mn;
 };
 
-extern unsigned long stack_size;
-extern unsigned long area_size;
-extern unsigned long user_stack_start;
-extern unsigned long user_stack_end;
-extern unsigned long shadow_stack_start;
-extern unsigned long shadow_stack_end;
-extern unsigned long sa_offset;
-
 long sa_init(void);
 
 struct sa_allocator_desc *alloc_create(struct mm_struct *mm);

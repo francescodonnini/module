@@ -20,8 +20,8 @@
 #include <linux/version.h>
 #include <linux/vmalloc.h>
 
-#define sa_shadow_addr(stack_base) (stack_base + sa_offset)
-#define sa_stack_index(b) (((b) - user_stack_start) / stack_size)
+#define sa_shadow_addr(stack_base) (shdwstck_start + shdwstck_delta)
+#define sa_stack_index(b) (((b) - shdwstck_start) / shdwstck_size)
 #define GL_SA_CAPACITY (16)
 
 enum {
@@ -57,13 +57,27 @@ static LIST_HEAD(gl_sa);
 static DEFINE_SPINLOCK(gl_lock);
 static DEFINE_XARRAY(sa_allocators);
 
-unsigned long stack_size;
-unsigned long area_size;
-unsigned long user_stack_start;
-unsigned long user_stack_end;
-unsigned long shadow_stack_start;
-unsigned long shadow_stack_end;
-unsigned long sa_offset;
+#ifdef SHADOWSTACK_DEBUG
+#define SHDWSTCK_PARAM_PERM 0444
+#else
+#define SHDWSTCK_PARAM_PERM 0
+#endif
+
+unsigned long shdwstck_size __ro_after_init;
+module_param(shdwstck_size, ulong, SHDWSTCK_PARAM_PERM);
+
+unsigned long shdwstck_area_size __ro_after_init;
+module_param(shdwstck_area_size, ulong, SHDWSTCK_PARAM_PERM);
+
+unsigned long shdwstck_user_start __ro_after_init;
+module_param(shdwstck_user_start, ulong, SHDWSTCK_PARAM_PERM);
+
+unsigned long shdwstck_start __ro_after_init;
+module_param(shdwstck_start, ulong, SHDWSTCK_PARAM_PERM);
+
+unsigned long shdwstck_user_end __ro_after_init;
+unsigned long shdwstck_end __ro_after_init;
+unsigned long shdwstck_delta __ro_after_init;
 
 void sa_mn_release(struct mmu_notifier *mn, struct mm_struct *mm);
 void sa_mn_free(struct mmu_notifier *mn);
@@ -218,7 +232,7 @@ static long gl_alloc_stack(struct sa_pagelist **p)
 		return -ENOMEM;
 	}
 
-	nr_pages = stack_size >> PAGE_SHIFT;
+	nr_pages = shdwstck_size >> PAGE_SHIFT;
 	err = sa_pagelist_alloc_pages(GFP_KERNEL | __GFP_ZERO, nr_pages,
 				      pagelist);
 	if (err) {
@@ -360,21 +374,27 @@ static void my_free_pgd_range(struct sa_tlb *tlb, unsigned long addr,
 
 long sa_init(void)
 {
-	if (shadow_stack_start <= user_stack_start)
+	if (!shdwstck_start || !shdwstck_user_start || !shdwstck_size ||
+	    !shdwstck_area_size) {
+		pr_err("stack_size, area_size, user_stack_start e shadow_stack_start are mandatory\n");
+		return -EINVAL;
+	}
+
+	if (shdwstck_start <= shdwstck_user_start)
 		return -EINVAL;
 
-	if (shadow_stack_start <= TASK_SIZE)
+	if (shdwstck_start <= TASK_SIZE)
 		return -EINVAL;
 
-	if (user_stack_start >= TASK_SIZE)
+	if (shdwstck_user_start >= TASK_SIZE)
 		return -EINVAL;
 
-	user_stack_end = user_stack_start + area_size;
-	if (user_stack_end >= TASK_SIZE)
+	shdwstck_user_end = shdwstck_user_start + shdwstck_area_size;
+	if (shdwstck_user_end >= TASK_SIZE)
 		return -EINVAL;
 
-	shadow_stack_end = shadow_stack_start + area_size;
-	sa_offset = shadow_stack_start - user_stack_start;
+	shdwstck_end = shdwstck_start + shdwstck_area_size;
+	shdwstck_delta = shdwstck_start - shdwstck_user_start;
 	return 0;
 }
 
@@ -637,22 +657,23 @@ static long map_range(struct mm_struct *mm, unsigned long addr,
 
 static inline unsigned long user_to_shadow(unsigned long base)
 {
-	return base + sa_offset;
+	return base + shdwstck_delta;
 }
 
 static bool valid_stack_base(unsigned long base)
 {
 	unsigned long shadow;
 
-	if (!IS_ALIGNED(base, stack_size))
+	if (!IS_ALIGNED(base, shdwstck_size))
 		return false;
 
-	if (base < user_stack_start || base + stack_size > user_stack_end)
+	if (base < shdwstck_user_start ||
+	    base + shdwstck_size > shdwstck_user_end)
 		return false;
 
 	shadow = user_to_shadow(base);
-	return shadow >= shadow_stack_start &&
-	       shadow + stack_size <= shadow_stack_end;
+	return shadow >= shdwstck_start &&
+	       shadow + shdwstck_size <= shdwstck_end;
 }
 
 /**
@@ -677,9 +698,9 @@ long sa_alloc(uint64_t stack_base)
 	}
 
 	sp = current_pt_regs()->sp;
-	if (sp < stack_base || sp >= stack_base + stack_size) {
+	if (sp < stack_base || sp >= stack_base + shdwstck_size) {
 		sa_user_error("sp %lx outside stack [%llx-%llx)\n", sp,
-			      stack_base, stack_base + stack_size);
+			      stack_base, stack_base + shdwstck_size);
 		return -EINVAL;
 	}
 
@@ -716,10 +737,10 @@ static struct sa_thread_desc *desc_by_sp(struct sa_allocator_desc *alloc,
 {
 	unsigned long base;
 
-	if (sp < user_stack_start || sp >= user_stack_end)
+	if (sp < shdwstck_user_start || sp >= shdwstck_user_end)
 		return NULL;
 
-	base = user_stack_start + sa_stack_index(sp) * stack_size;
+	base = shdwstck_user_start + sa_stack_index(sp) * shdwstck_size;
 	if (base == alloc->main.stack_base)
 		return &alloc->main;
 
@@ -835,7 +856,8 @@ long sa_fork(uint64_t *stack_base)
 	t->stack_base = pt->stack_base;
 	shadow_addr = sa_shadow_addr(t->stack_base);
 	mmap_write_lock(mm);
-	err = map_range(mm, shadow_addr, shadow_addr + stack_size, t->pagelist);
+	err = map_range(mm, shadow_addr, shadow_addr + shdwstck_size,
+			t->pagelist);
 	mmap_write_unlock(mm);
 	if (err)
 		goto err_pages;
@@ -911,7 +933,7 @@ long sa_pivot(uint64_t rsp, uint64_t new_stack_address)
 
 	new_start = new_area->vm_start;
 	if (!valid_stack_base(new_start) ||
-	    new_area->vm_end - new_area->vm_start != stack_size) {
+	    new_area->vm_end - new_area->vm_start != shdwstck_size) {
 		sa_user_error("bad new stack vma [%lx-%lx]\n",
 			      new_area->vm_start, new_area->vm_end);
 		err = -EINVAL;
@@ -919,7 +941,7 @@ long sa_pivot(uint64_t rsp, uint64_t new_stack_address)
 	}
 
 	shadow_stack = sa_shadow_addr(new_start);
-	err = map_range(mm, shadow_stack, shadow_stack + stack_size,
+	err = map_range(mm, shadow_stack, shadow_stack + shdwstck_size,
 			thread->pagelist);
 	if (err)
 		goto err_unlock;
@@ -953,7 +975,7 @@ long sa_pivot(uint64_t rsp, uint64_t new_stack_address)
 	sa_debug(SA_DEBUG_PIVOT,
 		 "pivot: [%lx-%lx) -> [%lx-%lx), delta %ld, shadow %lx\n",
 		 old_start, old_start + old_len, new_start,
-		 new_start + stack_size, delta, shadow_stack);
+		 new_start + shdwstck_size, delta, shadow_stack);
 	vm_munmap(old_start, old_len);
 	return 0;
 
@@ -973,7 +995,7 @@ static void sa_free_shadow_tables(struct mm_struct *mm)
 	struct sa_tlb tlb = { .mm = mm, .start = ULONG_MAX };
 
 	mmap_write_lock(mm);
-	my_free_pgd_range(&tlb, shadow_stack_start, shadow_stack_end);
+	my_free_pgd_range(&tlb, shdwstck_start, shdwstck_end);
 	mmap_write_unlock(mm);
 	sa_debug(SA_DEBUG_TLB, "tlb finish [%lx-%lx) mm %p\n", tlb.start,
 		 tlb.end, mm);
@@ -1077,7 +1099,7 @@ long sa_prepare(uint64_t stack_base, bool detached)
 
 	shadow = user_to_shadow(stack_base);
 	mmap_write_lock(mm);
-	err = map_range(mm, shadow, shadow + stack_size, t->pagelist);
+	err = map_range(mm, shadow, shadow + shdwstck_size, t->pagelist);
 	mmap_write_unlock(mm);
 	if (err)
 		goto free_pages;
@@ -1132,7 +1154,7 @@ static void sa_desc_release_list(struct list_head *list)
 	list_for_each_entry(t, list, list) {
 		unsigned long shadow = user_to_shadow(t->stack_base);
 
-		unmap_range(mm, shadow, shadow + stack_size);
+		unmap_range(mm, shadow, shadow + shdwstck_size);
 	}
 
 	mmap_write_unlock(mm);
