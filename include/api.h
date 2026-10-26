@@ -33,7 +33,7 @@ struct sa_allocator_desc {
 	struct mm_struct *mm;
 	struct xarray threads;
 	struct sa_thread_desc main;
-	struct mmu_notifier mn;
+	struct mmu_notifier notifier;
 };
 
 long sa_init(void);

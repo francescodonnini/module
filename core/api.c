@@ -409,7 +409,7 @@ struct sa_allocator_desc *alloc_create(struct mm_struct *mm)
 		return ERR_PTR(-ENOMEM);
 	}
 
-	alloc->mn.ops = &sa_mn_ops;
+	alloc->notifier.ops = &sa_mn_ops;
 	alloc->mm = mm;
 	xa_init(&alloc->threads);
 	err = xa_insert(&sa_allocators, (unsigned long)mm, alloc, GFP_KERNEL);
@@ -428,7 +428,7 @@ struct sa_allocator_desc *alloc_create(struct mm_struct *mm)
 		goto err_erase;
 	}
 
-	err = mmu_notifier_register(&alloc->mn, mm);
+	err = mmu_notifier_register(&alloc->notifier, mm);
 	if (err) {
 		sa_debug(SA_DEBUG_FAILED, "mmu_notifier_register failed: %ld\n",
 			 err);
@@ -876,7 +876,7 @@ err_pages:
 	t->pagelist = NULL;
 err_alloc:
 	xa_erase(&sa_allocators, (unsigned long)mm);
-	mmu_notifier_put(&alloc->mn);
+	mmu_notifier_put(&alloc->notifier);
 err_mmput:
 	sa_debug(SA_DEBUG_FAILED, "failed with error %ld\n", err);
 	mmput(parent_mm);
@@ -986,7 +986,7 @@ err_unlock:
 err_alloc:
 	sa_debug(SA_DEBUG_FAILED, "failer with error %ld\n", err);
 	xa_erase(&sa_allocators, (unsigned long)mm);
-	mmu_notifier_put(&alloc->mn);
+	mmu_notifier_put(&alloc->notifier);
 	return err;
 }
 
@@ -1009,7 +1009,7 @@ void sa_mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
 	unsigned long tid;
 	unsigned nr = 0;
 
-	alloc = container_of(mn, struct sa_allocator_desc, mn);
+	alloc = container_of(mn, struct sa_allocator_desc, notifier);
 	sa_debug(SA_DEBUG_ALLOCATOR, "releasing allocator %p (mm %p)\n", alloc,
 		 mm);
 	sa_debug(SA_DEBUG_ALLOCATOR, "releasing allocator %p (mm %p)\n", alloc,
@@ -1035,7 +1035,7 @@ void sa_mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
 void sa_mn_free(struct mmu_notifier *mn)
 {
 	struct sa_allocator_desc *alloc =
-		container_of(mn, struct sa_allocator_desc, mn);
+		container_of(mn, struct sa_allocator_desc, notifier);
 
 	sa_debug(SA_DEBUG_ALLOCATOR, "allocator %p freed\n", alloc);
 	kfree(alloc);
