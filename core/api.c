@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include "api.h"
 #include "compat.h"
 #include "pt_bindings.h"
 #include "tlb.h"
+#include <linux/compiler_attributes.h>
 #include <linux/highmem.h>
 #include <linux/io.h>
 #include <linux/mm.h>
@@ -20,6 +23,34 @@
 #define sa_shadow_addr(stack_base) (stack_base + sa_offset)
 #define sa_stack_index(b) (((b) - user_stack_start) / stack_size)
 #define GL_SA_CAPACITY (16)
+
+enum {
+	SA_DEBUG_USER_ERROR = 1U << 0,
+	SA_DEBUG_FAILED = 1U << 1,
+	SA_DEBUG_ALLOCATOR = 1U << 2,
+	SA_DEBUG_PIVOT = 1U << 3,
+	SA_DEBUG_FORK = 1U << 4,
+	SA_DEBUG_SLOT = 1U << 5,
+	SA_DEBUG_RECLAIM = 1U << 6,
+	SA_DEBUG_FREELIST = 1U << 7,
+	SA_DEBUG_PAGES = 1U << 8,
+	SA_DEBUG_PGTABLE = 1U << 9,
+	SA_DEBUG_TLB = 1U << 10,
+};
+
+#define sa_debug(mask, fmt, ...)                                              \
+	do {                                                                  \
+		if (unlikely(sa_debug_mask & (mask)))                         \
+			pr_info_ratelimited("%d:%d %s:%d" fmt, current->tgid, \
+					    current->pid, __func__, __LINE__, \
+					    ##__VA_ARGS__);                   \
+	} while (0)
+
+#define sa_user_error(fmt, ...) \
+	sa_debug(SA_DEBUG_USER_ERROR, fmt, ##__VA_ARGS__)
+
+static u32 sa_debug_mask = SA_DEBUG_USER_ERROR | SA_DEBUG_FAILED;
+module_param_named(debug_mask, sa_debug_mask, uint, 0644);
 
 static int gl_size;
 static LIST_HEAD(gl_sa);
@@ -71,14 +102,19 @@ static long sa_pagelist_alloc_pages(gfp_t gfp, unsigned long nr_pages,
 {
 	unsigned long nr_allocated;
 	unsigned long nr_remaining;
+	unsigned long nr_high = 0, nr_bulk = 0, nr_single = 0;
 	unsigned int max_attempt_order;
 	struct page *page;
 	int i;
 	unsigned int large_order;
 
 	pagelist->pages = kvcalloc(nr_pages, sizeof(struct page *), GFP_KERNEL);
-	if (!pagelist->pages)
+	if (!pagelist->pages) {
+		sa_debug(SA_DEBUG_FAILED,
+			 "pagelist: cannot allocate page array (%lu entries)\n",
+			 nr_pages);
 		return -ENOMEM;
+	}
 
 	nr_allocated = 0;
 	max_attempt_order = COMPAT_MAX_ORDER;
@@ -100,6 +136,7 @@ static long sa_pagelist_alloc_pages(gfp_t gfp, unsigned long nr_pages,
 			pagelist->pages[nr_allocated + i] = page + i;
 
 		nr_allocated += 1U << large_order;
+		nr_high += 1U << large_order;
 		nr_remaining = nr_pages - nr_allocated;
 		large_order = min_t(unsigned int, max_attempt_order,
 				    ilog2(nr_remaining));
@@ -113,6 +150,7 @@ static long sa_pagelist_alloc_pages(gfp_t gfp, unsigned long nr_pages,
 		nr = compat_alloc_pages_bulk(gfp, nr_pages_request,
 					     pagelist->pages + nr_allocated);
 		nr_allocated += nr;
+		nr_bulk += nr;
 		if (nr != nr_pages_request)
 			break;
 	}
@@ -128,10 +166,18 @@ static long sa_pagelist_alloc_pages(gfp_t gfp, unsigned long nr_pages,
 			break;
 
 		pagelist->pages[nr_allocated++] = page;
+		nr_single++;
 	}
 
 	pagelist->nr_pages = nr_allocated;
+	sa_debug(
+		SA_DEBUG_PAGES,
+		"pagelist: %lu/%lu pages (high-order %lu, bulk %lu, order-0 %lu)\n",
+		nr_allocated, nr_pages, nr_high, nr_bulk, nr_single);
 	if (nr_allocated != nr_pages) {
+		sa_debug(SA_DEBUG_FAILED,
+			 "pagelist: only %lu/%lu pages allocated\n",
+			 nr_allocated, nr_pages);
 		sa_pagelist_free_pages(pagelist);
 		return -ENOMEM;
 	}
@@ -149,22 +195,28 @@ static long gl_alloc_stack(struct sa_pagelist **p)
 {
 	struct sa_pagelist *pagelist;
 	unsigned long nr_pages;
+	int size;
 	long err;
 
 	spin_lock(&gl_lock);
 	pagelist = list_first_entry_or_null(&gl_sa, struct sa_pagelist, list);
 	if (pagelist) {
-		gl_size--;
+		size = --gl_size;
 		list_del(&pagelist->list);
 		spin_unlock(&gl_lock);
+		sa_debug(SA_DEBUG_FREELIST, "freelist hit (%d left)\n", size);
 		*p = pagelist;
 		return 0;
 	}
 
 	spin_unlock(&gl_lock);
+	sa_debug(SA_DEBUG_FREELIST, "freelist miss, allocation new stack\n");
 	pagelist = kmalloc_obj(*pagelist, GFP_KERNEL);
-	if (!pagelist)
+	if (!pagelist) {
+		sa_debug(SA_DEBUG_FAILED,
+			 "cannot allocate pagelist descriptor");
 		return -ENOMEM;
+	}
 
 	nr_pages = stack_size >> PAGE_SHIFT;
 	err = sa_pagelist_alloc_pages(GFP_KERNEL | __GFP_ZERO, nr_pages,
@@ -184,9 +236,12 @@ static long gl_alloc_stack(struct sa_pagelist **p)
  */
 static void gl_free(struct sa_pagelist *pagelist)
 {
-	int i;
+	int i, size;
 
 	if (gl_size >= GL_SA_CAPACITY) {
+		sa_debug(SA_DEBUG_FREELIST,
+			 "freelist full, releasing %d pages\n",
+			 pagelist->nr_pages);
 		sa_pagelist_free(pagelist);
 		return;
 	}
@@ -195,9 +250,11 @@ static void gl_free(struct sa_pagelist *pagelist)
 		clear_highpage(pagelist->pages[i]);
 
 	spin_lock(&gl_lock);
-	gl_size++;
+	size = ++gl_size;
 	list_add(&pagelist->list, &gl_sa);
 	spin_unlock(&gl_lock);
+	sa_debug(SA_DEBUG_FREELIST, "pagelist recycled (%d in freelist)\n",
+		 size);
 }
 
 static void free_pte_range(struct sa_tlb *tlb, pmd_t *pmd, unsigned long addr,
@@ -289,6 +346,8 @@ static void my_free_pgd_range(struct sa_tlb *tlb, unsigned long addr,
 	unsigned long next;
 
 	mmap_assert_write_locked(tlb->mm);
+	sa_debug(SA_DEBUG_PGTABLE, "freeing page tables [%lx-%lx) mm %p\n",
+		 addr, end, tlb->mm);
 	pgd = pgd_offset(tlb->mm, addr);
 	do {
 		next = pgd_addr_end(addr, end);
@@ -325,25 +384,39 @@ struct sa_allocator_desc *alloc_create(struct mm_struct *mm)
 	long err;
 
 	alloc = kzalloc_obj(*alloc, GFP_KERNEL);
-	if (!alloc)
+	if (!alloc) {
+		sa_debug(SA_DEBUG_FAILED, "out of memory\n");
 		return ERR_PTR(-ENOMEM);
+	}
 
 	alloc->mn.ops = &sa_mn_ops;
 	alloc->mm = mm;
 	xa_init(&alloc->threads);
 	err = xa_insert(&sa_allocators, (unsigned long)mm, alloc, GFP_KERNEL);
-	if (err)
+	if (err) {
+		if (err == -EBUSY)
+			sa_user_error("mm %p already has an allocator\n", mm);
+		else
+			sa_debug(SA_DEBUG_FAILED, "xa_insert failed: %ld\n",
+				 err);
 		goto err_free;
+	}
 
 	if (!try_module_get(THIS_MODULE)) {
+		sa_debug(SA_DEBUG_FAILED, "module is going away\n");
 		err = -ENODEV;
 		goto err_erase;
 	}
 
 	err = mmu_notifier_register(&alloc->mn, mm);
-	if (err)
+	if (err) {
+		sa_debug(SA_DEBUG_FAILED, "mmu_notifier_register failed: %ld\n",
+			 err);
 		goto err_module;
+	}
 
+	sa_debug(SA_DEBUG_ALLOCATOR, "allocator %p created for mm %p\n", alloc,
+		 mm);
 	return alloc;
 
 err_module:
@@ -433,6 +506,7 @@ static inline void unmap_range(struct mm_struct *mm, uint64_t addr,
 	pgd_t *pgd;
 
 	mmap_assert_write_locked(mm);
+	sa_debug(SA_DEBUG_PGTABLE, "unmapping [%lx-%llx)\n", start, end);
 	pgd = pgd_offset(mm, addr);
 	do {
 		next = pgd_addr_end(addr, end);
@@ -549,11 +623,15 @@ static long map_range(struct mm_struct *mm, unsigned long addr,
 	} while (pgd++, addr = next, addr != end);
 
 	if (err < 0) {
+		sa_debug(SA_DEBUG_FAILED,
+			 "map_range [%lx-%lx) failed near %lx: %ld\n", start,
+			 end, addr, err);
 		// If something goes wrong, we don't remove the tables already allocated because they can be re-used in the future
 		// by another thread that recycles the virtual address (and by adjacent threads too)
 		unmap_range(mm, start, next);
 	}
 
+	sa_debug(SA_DEBUG_PGTABLE, "mapped [%lx-%lx)\n", start, end);
 	return err;
 }
 
@@ -593,16 +671,23 @@ long sa_alloc(uint64_t stack_base)
 	long err;
 	struct sa_thread_desc *t;
 
-	if (!valid_stack_base(stack_base))
+	if (!valid_stack_base(stack_base)) {
+		sa_user_error("invalid stack base %llx\n", stack_base);
 		return -EINVAL;
+	}
 
 	sp = current_pt_regs()->sp;
-	if (sp < stack_base || sp >= stack_base + stack_size)
+	if (sp < stack_base || sp >= stack_base + stack_size) {
+		sa_user_error("sp %lx outside stack [%llx-%llx)\n", sp,
+			      stack_base, stack_base + stack_size);
 		return -EINVAL;
+	}
 
 	alloc = alloc_find(current->mm);
-	if (!alloc)
+	if (!alloc) {
+		sa_user_error("no allocator for current mm\n");
 		return -EINVAL;
+	}
 
 	id = sa_stack_index(stack_base);
 	pid = get_pid(task_pid(current));
@@ -616,9 +701,13 @@ long sa_alloc(uint64_t stack_base)
 	}
 
 	xa_unlock(&alloc->threads);
-	if (err)
+	if (err) {
+		sa_user_error("slot %lu not prepared (state %d)\n", id,
+			      t ? t->state : -1);
 		put_pid(pid);
+	}
 
+	sa_debug(SA_DEBUG_SLOT, "slot %lu owned (base %llx)\n", id, stack_base);
 	return err;
 }
 
@@ -642,27 +731,41 @@ long sa_detach(u64 stack_base)
 	struct mm_struct *mm;
 	struct sa_allocator_desc *alloc;
 	struct sa_thread_desc *t;
+	unsigned long id;
 	long err = 0;
 
 	mm = current->mm;
-	if (!mm || !valid_stack_base(stack_base))
+	if (!mm || !valid_stack_base(stack_base)) {
+		sa_user_error("invalid stack base %llx\n", stack_base);
 		return -EINVAL;
+	}
 
 	alloc = alloc_find(mm);
-	if (!alloc)
+	if (!alloc) {
+		sa_user_error("no allocator for current mm\n");
 		return -EINVAL;
+	}
 
-	if (stack_base == alloc->main.stack_base)
+	if (stack_base == alloc->main.stack_base) {
+		sa_debug(SA_DEBUG_SLOT, "main stack, ignored\n");
 		return 0;
+	}
 
+	id = sa_stack_index(stack_base);
 	xa_lock(&alloc->threads);
-	t = xa_load(&alloc->threads, sa_stack_index(stack_base));
+	t = xa_load(&alloc->threads, id);
 	if (t)
 		t->detached = true;
 	else
 		err = -EINVAL;
 
 	xa_unlock(&alloc->threads);
+
+	if (err)
+		sa_user_error("slot %lu not found\n", id);
+	else
+		sa_debug(SA_DEBUG_SLOT, "slot %lu detached\n", id);
+
 	return err;
 }
 
@@ -689,11 +792,14 @@ long sa_fork(uint64_t *stack_base)
 
 	parent_mm = get_task_mm(parent);
 	put_task_struct(parent);
-	if (!parent_mm)
+	if (!parent_mm) {
+		sa_user_error("parent has no mm\n");
 		return -ESRCH;
+	}
 
 	pa = alloc_find(parent_mm);
 	if (!pa) {
+		sa_user_error("no allocator for parent mm %p\n", parent_mm);
 		err = -ENOENT;
 		goto err_mmput;
 	}
@@ -706,6 +812,8 @@ long sa_fork(uint64_t *stack_base)
 
 	pt = desc_by_sp(pa, current_pt_regs()->sp);
 	if (!pt || pt->state != SA_OWNED) {
+		sa_user_error("sp %lx not on an owned parent stack\n",
+			      current_pt_regs()->sp);
 		err = -ENOENT;
 		goto err_mmput;
 	}
@@ -735,6 +843,9 @@ long sa_fork(uint64_t *stack_base)
 	t->owner = get_pid(task_pid(current));
 	t->state = SA_OWNED;
 	*stack_base = t->stack_base;
+	sa_debug(SA_DEBUG_FORK,
+		 "copied stack %llx (%d pages) from parent mm %p\n",
+		 t->stack_base, pt->pagelist->nr_pages, parent_mm);
 	mmput(parent_mm);
 	return 0;
 
@@ -745,6 +856,7 @@ err_alloc:
 	xa_erase(&sa_allocators, (unsigned long)mm);
 	mmu_notifier_put(&alloc->mn);
 err_mmput:
+	sa_debug(SA_DEBUG_FAILED, "failed with error %ld\n", err);
 	mmput(parent_mm);
 	return err;
 }
@@ -785,12 +897,14 @@ long sa_pivot(uint64_t rsp, uint64_t new_stack_address)
 	mmap_write_lock(mm);
 	old_area = find_vma(mm, rsp);
 	if (!old_area || old_area->vm_start > rsp) {
+		sa_user_error("no_vma for rsp %llx\n", rsp);
 		err = -EINVAL;
 		goto err_unlock;
 	}
 
 	new_area = find_vma(mm, new_stack_address);
 	if (!new_area || new_area->vm_start > new_stack_address) {
+		sa_user_error("no vma for new stack %llx\n", new_stack_address);
 		err = -EINVAL;
 		goto err_unlock;
 	}
@@ -798,6 +912,8 @@ long sa_pivot(uint64_t rsp, uint64_t new_stack_address)
 	new_start = new_area->vm_start;
 	if (!valid_stack_base(new_start) ||
 	    new_area->vm_end - new_area->vm_start != stack_size) {
+		sa_user_error("bad new stack vma [%lx-%lx]\n",
+			      new_area->vm_start, new_area->vm_end);
 		err = -EINVAL;
 		goto err_unlock;
 	}
@@ -834,6 +950,10 @@ long sa_pivot(uint64_t rsp, uint64_t new_stack_address)
 	vm_flags_clear(old_area, VM_GROWSDOWN);
 	vm_flags_set(new_area, VM_GROWSDOWN);
 	mmap_write_unlock(mm);
+	sa_debug(SA_DEBUG_PIVOT,
+		 "pivot: [%lx-%lx) -> [%lx-%lx), delta %ld, shadow %lx\n",
+		 old_start, old_start + old_len, new_start,
+		 new_start + stack_size, delta, shadow_stack);
 	vm_munmap(old_start, old_len);
 	return 0;
 
@@ -842,6 +962,7 @@ err_unlock:
 	gl_free(thread->pagelist);
 	thread->pagelist = NULL;
 err_alloc:
+	sa_debug(SA_DEBUG_FAILED, "failer with error %ld\n", err);
 	xa_erase(&sa_allocators, (unsigned long)mm);
 	mmu_notifier_put(&alloc->mn);
 	return err;
@@ -854,6 +975,8 @@ static void sa_free_shadow_tables(struct mm_struct *mm)
 	mmap_write_lock(mm);
 	my_free_pgd_range(&tlb, shadow_stack_start, shadow_stack_end);
 	mmap_write_unlock(mm);
+	sa_debug(SA_DEBUG_TLB, "tlb finish [%lx-%lx) mm %p\n", tlb.start,
+		 tlb.end, mm);
 	sa_tlb_finish(&tlb);
 }
 
@@ -862,8 +985,13 @@ void sa_mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
 	struct sa_allocator_desc *alloc;
 	struct sa_thread_desc *t;
 	unsigned long tid;
+	unsigned nr = 0;
 
 	alloc = container_of(mn, struct sa_allocator_desc, mn);
+	sa_debug(SA_DEBUG_ALLOCATOR, "releasing allocator %p (mm %p)\n", alloc,
+		 mm);
+	sa_debug(SA_DEBUG_ALLOCATOR, "releasing allocator %p (mm %p)\n", alloc,
+		 mm);
 	xa_erase(&sa_allocators, (unsigned long)mm);
 	sa_free_shadow_tables(mm);
 	if (alloc->main.pagelist)
@@ -874,14 +1002,21 @@ void sa_mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
 		gl_free(t->pagelist);
 		put_pid(t->owner);
 		kfree(t);
+		nr++;
 	}
 	xa_destroy(&alloc->threads);
+	sa_debug(SA_DEBUG_ALLOCATOR, "allocator %p: released %u thread slots\n",
+		 alloc, nr);
 	mmu_notifier_put(mn);
 }
 
 void sa_mn_free(struct mmu_notifier *mn)
 {
-	kfree(container_of(mn, struct sa_allocator_desc, mn));
+	struct sa_allocator_desc *alloc =
+		container_of(mn, struct sa_allocator_desc, mn);
+
+	sa_debug(SA_DEBUG_ALLOCATOR, "allocator %p freed\n", alloc);
+	kfree(alloc);
 	module_put(THIS_MODULE);
 }
 
@@ -897,31 +1032,38 @@ long sa_prepare(uint64_t stack_base, bool detached)
 	if (!mm)
 		return -EINVAL;
 
-	if (!valid_stack_base(stack_base))
+	if (!valid_stack_base(stack_base)) {
+		sa_user_error("invalid stack base %llx\n", stack_base);
 		return -EINVAL;
+	}
 
 	alloc = alloc_find(mm);
-	if (!alloc)
+	if (!alloc) {
+		sa_user_error("no allocator for current mm\n");
 		return -EINVAL;
+	}
 
 	if (stack_base == alloc->main.stack_base) {
-		pr_warn_ratelimited("shadowstack: prepare on main's stack\n");
+		sa_user_error("%llx is the main stack\n", stack_base);
 		return -EBUSY;
 	}
 
 	id = sa_stack_index(stack_base);
 	err = xa_insert(&alloc->threads, id, NULL, GFP_KERNEL);
 	if (err == -EBUSY) {
-		pr_warn_ratelimited(
-			"shadowstack: stack slot %lu already in use\n", id);
+		sa_user_error("slot %lu already in use\n", id);
 		return err;
 	}
 
-	if (err)
+	if (err) {
+		sa_debug(SA_DEBUG_FAILED, "xa_insert slot %lu failed: %ld\n",
+			 id, err);
 		return err;
+	}
 
 	t = kzalloc_obj(struct sa_thread_desc, GFP_KERNEL);
 	if (!t) {
+		sa_debug(SA_DEBUG_FAILED, "cannot allocate descriptor\n");
 		err = -ENOMEM;
 		goto release;
 	}
@@ -941,6 +1083,9 @@ long sa_prepare(uint64_t stack_base, bool detached)
 		goto free_pages;
 
 	xa_store(&alloc->threads, id, t, GFP_KERNEL);
+	sa_debug(SA_DEBUG_SLOT,
+		 "slot %lu prepared (base %llx, shadow %lx, detached %d)\n", id,
+		 stack_base, shadow, detached);
 	return 0;
 
 free_pages:
@@ -1005,26 +1150,33 @@ long sa_reclaim(uint64_t stack_base)
 	struct sa_thread_desc *t;
 	unsigned long index;
 	LIST_HEAD(dead);
+	const char *why = NULL;
 	long err;
 
 	mm = current->mm;
 	if (!mm)
 		return -EINVAL;
 
-	if (!valid_stack_base(stack_base))
+	if (!valid_stack_base(stack_base)) {
+		sa_user_error("invalid stack base %llx\n", stack_base);
 		return -EINVAL;
+	}
 
 	alloc = alloc_find(mm);
-	if (!alloc)
+	if (!alloc) {
+		sa_user_error("no allocator for current mm\n");
 		return -EINVAL;
+	}
 
 	err = 0;
 	index = sa_stack_index(stack_base);
 	xa_lock(&alloc->threads);
 	t = xa_load(&alloc->threads, index);
 	if (!t || t->state != SA_OWNED) {
+		why = "not owned";
 		err = -EINVAL;
 	} else if (t->detached) {
+		why = "detached";
 		err = -EINVAL;
 	} else if (!owner_gone(t->owner)) {
 		err = -EAGAIN;
@@ -1034,9 +1186,19 @@ long sa_reclaim(uint64_t stack_base)
 	}
 
 	xa_unlock(&alloc->threads);
-	if (!err)
-		sa_desc_release_list(&dead);
+	if (err == -EINVAL) {
+		sa_user_error("slot %lu %s\n", index, why);
+		return err;
+	}
 
+	if (err == -EAGAIN) {
+		sa_debug(SA_DEBUG_RECLAIM, "slot %lu: owner still alive\n",
+			 index);
+		return err;
+	}
+
+	sa_desc_release_list(&dead);
+	sa_debug(SA_DEBUG_RECLAIM, "slot %lu reclaimed\n", index);
 	return err;
 }
 
@@ -1056,16 +1218,20 @@ long sa_reclaim_dead(u64 __user *reclaimed, unsigned cap)
 		return -EINVAL;
 
 	alloc = alloc_find(mm);
-	if (!alloc)
+	if (!alloc) {
+		sa_user_error("sa_reclaim_dead: no allocator for current mm\n");
 		return -EINVAL;
+	}
 
 	cap = min_t(unsigned, cap, 256);
 	if (!cap)
 		return 0;
 
 	bases = kmalloc_array(cap, sizeof(*bases), GFP_KERNEL);
-	if (!bases)
+	if (!bases) {
+		sa_debug(SA_DEBUG_FAILED, "cannot allocate %u bases\n", cap);
 		return -ENOMEM;
+	}
 
 	xa_lock(&alloc->threads);
 	n = 0;
@@ -1083,9 +1249,13 @@ long sa_reclaim_dead(u64 __user *reclaimed, unsigned cap)
 
 	xa_unlock(&alloc->threads);
 	sa_desc_release_list(&dead);
+	sa_debug(SA_DEBUG_RECLAIM, "reclaimed %u detached slots (cap %u)\n", n,
+		 cap);
 	ret = n;
-	if (n && copy_to_user(reclaimed, bases, n * sizeof(*bases)))
+	if (n && copy_to_user(reclaimed, bases, n * sizeof(*bases))) {
+		sa_user_error("bad user buffer %p\n", reclaimed);
 		ret = -EFAULT;
+	}
 
 	kfree(bases);
 	return ret;
@@ -1099,31 +1269,45 @@ long sa_unprepare(u64 stack_base)
 	unsigned long index;
 	LIST_HEAD(dead);
 	long err = -EINVAL;
+	int state = -1;
 
-	if (!valid_stack_base(stack_base))
+	if (!valid_stack_base(stack_base)) {
+		sa_user_error("invalid stack base %llx\n", stack_base);
 		return -EINVAL;
+	}
 
 	mm = current->mm;
 	if (!mm)
 		return -EINVAL;
 
 	alloc = alloc_find(mm);
-	if (!alloc)
+	if (!alloc) {
+		sa_user_error("no allocator for current mm\n");
 		return -EINVAL;
+	}
 
 	index = sa_stack_index(stack_base);
 	xa_lock(&alloc->threads);
 	t = xa_load(&alloc->threads, index);
-	if (t && t->state == SA_PREPARED) {
-		__xa_erase(&alloc->threads, index);
-		list_add(&t->list, &dead);
-		err = 0;
+	if (t) {
+		state = t->state;
+		if (t->state == SA_PREPARED) {
+			__xa_erase(&alloc->threads, index);
+			list_add(&t->list, &dead);
+			err = 0;
+		}
 	}
 
 	xa_unlock(&alloc->threads);
-	if (!err)
-		sa_desc_release_list(&dead);
+	if (err) {
+		sa_user_error(
+			"sa_unprepare: slot %lu not prepared (state %d)\n",
+			index, state);
+		return err;
+	}
 
+	sa_desc_release_list(&dead);
+	sa_debug(SA_DEBUG_SLOT, "slot %lu unprepared\n", index);
 	return err;
 }
 
