@@ -278,7 +278,7 @@ static void free_pte_range(struct sa_tlb *tlb, pmd_t *pmd, unsigned long addr,
 
 	pte = pmd_pgtable(*pmd);
 	pmd_clear(pmd);
-	tlb_free_pte(tlb, pte, addr);
+	sa_tlb_add(tlb, pte);
 	mm_dec_nr_ptes(tlb->mm);
 }
 
@@ -301,7 +301,7 @@ static void free_pmd_range(struct sa_tlb *tlb, pud_t *pud, unsigned long addr,
 
 	pmd = pmd_offset(pud, start);
 	pud_clear(pud);
-	// pmd_free_tlb();
+	sa_tlb_add(tlb, virt_to_page(pmd));
 	mm_dec_nr_pmds(tlb->mm);
 }
 
@@ -324,7 +324,7 @@ static void free_pud_range(struct sa_tlb *tlb, p4d_t *p4d, unsigned long addr,
 
 	pud = pud_offset(p4d, start);
 	p4d_clear(p4d);
-	// pud_free_tlb(tlb, pud, start);
+	sa_tlb_add(tlb, virt_to_page(pud));
 	mm_dec_nr_puds(tlb->mm);
 }
 
@@ -347,7 +347,7 @@ static void free_p4d_range(struct sa_tlb *tlb, pgd_t *pgd, unsigned long addr,
 
 	p4d = p4d_offset(pgd, start);
 	pgd_clear(pgd);
-	// p4d_free_tlb(tlb, p4d, start);
+	sa_tlb_add(tlb, virt_to_page(p4d));
 }
 
 /**
@@ -370,6 +370,17 @@ static void my_free_pgd_range(struct sa_tlb *tlb, unsigned long addr,
 
 		free_p4d_range(tlb, pgd, addr, next);
 	} while (pgd++, addr = next, addr != end);
+
+	if (tlb->batch && tlb->batch->nr > 0) {
+		int i;
+
+		my_flush_tlb_mm(tlb->mm);
+		for (i = 0; i < tlb->batch->nr; ++i)
+			__free_page(tlb->batch->tables[i]);
+	}
+
+	if (tlb->batch)
+		__free_page((struct page *)tlb->batch);
 }
 
 long sa_init(void)
@@ -992,14 +1003,15 @@ err_alloc:
 
 static void sa_free_shadow_tables(struct mm_struct *mm)
 {
-	struct sa_tlb tlb = { .mm = mm, .start = ULONG_MAX };
+	struct sa_tlb tlb = { .mm = mm,
+			      .batch = (struct sa_batch *)__get_free_page(
+				      GFP_KERNEL) };
 
 	mmap_write_lock(mm);
 	my_free_pgd_range(&tlb, shdwstck_start, shdwstck_end);
 	mmap_write_unlock(mm);
-	sa_debug(SA_DEBUG_TLB, "tlb finish [%lx-%lx) mm %p\n", tlb.start,
-		 tlb.end, mm);
-	sa_tlb_finish(&tlb);
+	sa_debug(SA_DEBUG_TLB, "tlb finish [%lx-%lx) mm %p\n", shdwstck_start,
+		 shdwstck_end, mm);
 }
 
 void sa_mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
@@ -1241,7 +1253,7 @@ long sa_reclaim_dead(u64 __user *reclaimed, unsigned cap)
 
 	alloc = alloc_find(mm);
 	if (!alloc) {
-		sa_user_error("sa_reclaim_dead: no allocator for current mm\n");
+		sa_user_error("no allocator for current mm\n");
 		return -EINVAL;
 	}
 
