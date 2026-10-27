@@ -18,7 +18,6 @@
 #include <linux/types.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
-#define GL_SA_CAPACITY (16)
 
 enum {
 	SA_DEBUG_USER_ERROR = 1U << 0,
@@ -48,6 +47,8 @@ enum {
 static u32 sa_debug_mask = SA_DEBUG_USER_ERROR | SA_DEBUG_FAILED;
 module_param_named(debug_mask, sa_debug_mask, uint, 0644);
 
+#define GL_SA_CAPACITY (16)
+
 static int gl_size;
 static LIST_HEAD(gl_sa);
 static DEFINE_SPINLOCK(gl_lock);
@@ -75,7 +76,7 @@ unsigned long shdwstck_user_end __ro_after_init;
 unsigned long shdwstck_end __ro_after_init;
 unsigned long shdwstck_delta __ro_after_init;
 
-#define shdwstck_addr(stack_base) (shdwstck_start + shdwstck_delta)
+#define shdwstck_addr(stack_base) (stack_base + shdwstck_delta)
 #define shdwstck_idx(b) (((b) - shdwstck_start) / shdwstck_size)
 
 struct sa_batch {
@@ -685,6 +686,7 @@ static long map_range(struct mm_struct *mm, unsigned long addr,
 	long err;
 
 	mmap_assert_write_locked(mm);
+	err = 0;
 	start = addr;
 	pgd = pgd_offset(mm, addr);
 	do {
@@ -707,11 +709,6 @@ static long map_range(struct mm_struct *mm, unsigned long addr,
 	return err;
 }
 
-static inline unsigned long user_to_shadow(unsigned long base)
-{
-	return base + shdwstck_delta;
-}
-
 static bool valid_stack_base(unsigned long base)
 {
 	unsigned long shadow;
@@ -723,7 +720,7 @@ static bool valid_stack_base(unsigned long base)
 	    base + shdwstck_size > shdwstck_user_end)
 		return false;
 
-	shadow = user_to_shadow(base);
+	shadow = shdwstck_addr(base);
 	return shadow >= shdwstck_start &&
 	       shadow + shdwstck_size <= shdwstck_end;
 }
@@ -1065,8 +1062,6 @@ void sa_mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
 	alloc = container_of(mn, struct sa_allocator_desc, notifier);
 	sa_debug(SA_DEBUG_ALLOCATOR, "releasing allocator %p (mm %p)\n", alloc,
 		 mm);
-	sa_debug(SA_DEBUG_ALLOCATOR, "releasing allocator %p (mm %p)\n", alloc,
-		 mm);
 	xa_erase(&sa_allocators, (unsigned long)mm);
 	sa_free_shadow_tables(mm);
 	if (alloc->main.pagelist)
@@ -1150,7 +1145,7 @@ long sa_prepare(uint64_t stack_base, bool detached)
 	if (err)
 		goto free_desc;
 
-	shadow = user_to_shadow(stack_base);
+	shadow = shdwstck_addr(stack_base);
 	mmap_write_lock(mm);
 	err = map_range(mm, shadow, shadow + shdwstck_size, t->pagelist);
 	mmap_write_unlock(mm);
@@ -1205,7 +1200,7 @@ static void sa_desc_release_list(struct list_head *list)
 
 	mmap_write_lock(mm);
 	list_for_each_entry(t, list, list) {
-		unsigned long shadow = user_to_shadow(t->stack_base);
+		unsigned long shadow = shdwstck_addr(t->stack_base);
 
 		unmap_range(mm, shadow, shadow + shdwstck_size);
 	}
