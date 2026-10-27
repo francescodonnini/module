@@ -46,7 +46,7 @@ long sa_detach(u64 stack_base);
 
 long sa_fork(u64 *stack_base);
 
-long sa_pivot(u64 rsp, u64 new_stack_address);
+long sa_pivot(u64 rsp, u64 new_stack_address, u64 *sa_delta);
 
 long sa_prepare(u64 stack_base, bool detached);
 

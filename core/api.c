@@ -940,7 +940,7 @@ err_mmput:
  *
  * Returns 0 on success, <0 otherwise
  */
-long sa_pivot(uint64_t rsp, uint64_t new_stack_address)
+long sa_pivot(u64 rsp, u64 new_stack_address, u64 *sa_delta)
 {
 	struct mm_struct *mm;
 	struct sa_allocator_desc *alloc;
@@ -1026,7 +1026,8 @@ long sa_pivot(uint64_t rsp, uint64_t new_stack_address)
 		 old_start, old_start + old_len, new_start,
 		 new_start + shdwstck_size, delta, shadow_stack);
 	vm_munmap(old_start, old_len);
-	return 0;
+	*sa_delta = shdwstck_delta;
+	return err;
 
 err_unlock:
 	mmap_write_unlock(mm);

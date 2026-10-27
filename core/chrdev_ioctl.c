@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "api.h"
 #include "chrdev.h"
-#include "chrdev_ioctl.h"
+#include "uapi.h"
 #include <asm/errno.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
@@ -21,9 +21,13 @@ static long check_ioctl_cmd(unsigned int cmd)
 
 	switch (cmd) {
 	case IOCTL_SHADOW_ALLOC:
+	case IOCTL_SHADOW_DETACH:
 	case IOCTL_SHADOW_FORK:
 	case IOCTL_SHADOW_PIVOT:
+	case IOCTL_SHADOW_PREPARE:
 	case IOCTL_SHADOW_RECLAIM:
+	case IOCTL_SHADOW_RECLAIM_DEAD:
+	case IOCTL_SHADOW_UNPREPARE:
 		break;
 	default:
 		return -ENOTTY;
@@ -48,7 +52,7 @@ long chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 	switch (cmd) {
 	case IOCTL_SHADOW_ALLOC: {
-		struct ioctl_alloc_params req;
+		struct ioctl_stack_params req;
 
 		if (copy_from_user(&req, user_arg, sizeof(req)))
 			return -EFAULT;
@@ -60,7 +64,7 @@ long chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 	}
 	case IOCTL_SHADOW_FORK: {
-		struct ioctl_fork_params req;
+		struct ioctl_stack_params req;
 
 		if (copy_from_user(&req, user_arg, sizeof(req)))
 			return -EFAULT;
@@ -72,7 +76,7 @@ long chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 	}
 	case IOCTL_SHADOW_DETACH: {
-		struct ioctl_detach_params req;
+		struct ioctl_stack_params req;
 
 		if (copy_from_user(&req, user_arg, sizeof(req)))
 			return -EFAULT;
@@ -89,7 +93,8 @@ long chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (copy_from_user(&req, user_arg, sizeof(req)))
 			return -EFAULT;
 
-		req.error = sa_pivot(req.rsp, req.new_stack_address);
+		req.error =
+			sa_pivot(req.rsp, req.new_stack_address, &req.delta);
 		if (copy_to_user(user_arg, &req, sizeof(req)))
 			return -EFAULT;
 
@@ -108,7 +113,7 @@ long chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 	}
 	case IOCTL_SHADOW_RECLAIM: {
-		struct ioctl_reclaim_params req;
+		struct ioctl_stack_params req;
 
 		if (copy_from_user(&req, user_arg, sizeof(req)))
 			return -EFAULT;
@@ -135,7 +140,7 @@ long chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 	}
 	case IOCTL_SHADOW_UNPREPARE: {
-		struct ioctl_unprepare_params req;
+		struct ioctl_stack_params req;
 
 		if (copy_from_user(&req, user_arg, sizeof(req)))
 			return -EFAULT;
