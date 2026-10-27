@@ -4,7 +4,6 @@
 #include "api.h"
 #include "compat.h"
 #include "pt_bindings.h"
-#include "tlb.h"
 #include <linux/compiler_attributes.h>
 #include <linux/highmem.h>
 #include <linux/io.h>
@@ -78,6 +77,44 @@ module_param(shdwstck_start, ulong, SHDWSTCK_PARAM_PERM);
 unsigned long shdwstck_user_end __ro_after_init;
 unsigned long shdwstck_end __ro_after_init;
 unsigned long shdwstck_delta __ro_after_init;
+
+struct sa_batch {
+	unsigned int nr;
+	void *tables[];
+};
+#define MAX_BATCH_SIZE ((PAGE_SIZE - sizeof(struct sa_batch)) / sizeof(void *))
+
+struct sa_tlb {
+	struct mm_struct *mm;
+	struct sa_batch *batch;
+};
+
+static void sa_tlb_add(struct sa_tlb *tlb, pgtable_t page)
+{
+	struct sa_batch **batch = &tlb->batch;
+
+	if (!*batch) {
+		*batch = (struct sa_batch *)__get_free_page(GFP_NOWAIT);
+		if (!*batch) {
+			my_flush_tlb_mm(tlb->mm);
+			__free_page(page);
+			return;
+		}
+
+		(*batch)->nr = 0;
+	}
+
+	(*batch)->tables[(*batch)->nr++] = page;
+	if ((*batch)->nr == MAX_BATCH_SIZE) {
+		int i;
+
+		my_flush_tlb_mm(tlb->mm);
+		for (i = 0; i < (*batch)->nr; ++i)
+			__free_page((*batch)->tables[i]);
+
+		(*batch)->nr = 0;
+	}
+}
 
 void sa_mn_release(struct mmu_notifier *mn, struct mm_struct *mm);
 void sa_mn_free(struct mmu_notifier *mn);
