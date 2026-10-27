@@ -58,7 +58,7 @@ struct ioctl_reclaim_dead_params {
 	      struct ioctl_pivot_params)
 #define IOCTL_SHADOW_PREPARE                               \
 	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_PREPARE_NO, \
-	      struct ioctl_stack_params)
+	      struct ioctl_prepare_params)
 #define IOCTL_SHADOW_RECLAIM                               \
 	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_RECLAIM_NO, \
 	      struct ioctl_stack_params)
