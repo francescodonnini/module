@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef LKM_IOCTL_H
-#define LKM_IOCTL_H
+#ifndef UAPI_SHDWSTCK_H
+#define UAPI_SHDWSTCK_H
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
