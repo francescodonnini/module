@@ -18,9 +18,6 @@
 #include <linux/types.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
-
-#define sa_shadow_addr(stack_base) (shdwstck_start + shdwstck_delta)
-#define sa_stack_index(b) (((b) - shdwstck_start) / shdwstck_size)
 #define GL_SA_CAPACITY (16)
 
 enum {
@@ -77,6 +74,9 @@ module_param(shdwstck_start, ulong, SHDWSTCK_PARAM_PERM);
 unsigned long shdwstck_user_end __ro_after_init;
 unsigned long shdwstck_end __ro_after_init;
 unsigned long shdwstck_delta __ro_after_init;
+
+#define shdwstck_addr(stack_base) (shdwstck_start + shdwstck_delta)
+#define shdwstck_idx(b) (((b) - shdwstck_start) / shdwstck_size)
 
 struct sa_batch {
 	unsigned int nr;
@@ -382,6 +382,9 @@ static void free_p4d_range(struct sa_tlb *tlb, pgd_t *pgd, unsigned long addr,
 		free_pud_range(tlb, p4d, addr, next);
 	} while (p4d++, addr = next, addr != end);
 
+	if (!pgtable_l5_enabled())
+		return;
+
 	p4d = p4d_offset(pgd, start);
 	pgd_clear(pgd);
 	sa_tlb_add(tlb, virt_to_page(p4d));
@@ -660,6 +663,7 @@ static long map_p4d_range(struct mm_struct *mm, pgd_t *pgd, unsigned long addr,
 		if (map_pud_range(mm, p4d, addr, next, start, pages))
 			return -ENOMEM;
 	} while (p4d++, addr = next, addr != end);
+
 	return 0;
 }
 
@@ -758,7 +762,7 @@ long sa_alloc(uint64_t stack_base)
 		return -EINVAL;
 	}
 
-	id = sa_stack_index(stack_base);
+	id = shdwstck_idx(stack_base);
 	pid = get_pid(task_pid(current));
 	err = -EINVAL;
 	xa_lock(&alloc->threads);
@@ -788,11 +792,11 @@ static struct sa_thread_desc *desc_by_sp(struct sa_allocator_desc *alloc,
 	if (sp < shdwstck_user_start || sp >= shdwstck_user_end)
 		return NULL;
 
-	base = shdwstck_user_start + sa_stack_index(sp) * shdwstck_size;
+	base = shdwstck_user_start + shdwstck_idx(sp) * shdwstck_size;
 	if (base == alloc->main.stack_base)
 		return &alloc->main;
 
-	return xa_load(&alloc->threads, sa_stack_index(base));
+	return xa_load(&alloc->threads, shdwstck_idx(base));
 }
 
 long sa_detach(u64 stack_base)
@@ -820,7 +824,7 @@ long sa_detach(u64 stack_base)
 		return 0;
 	}
 
-	id = sa_stack_index(stack_base);
+	id = shdwstck_idx(stack_base);
 	xa_lock(&alloc->threads);
 	t = xa_load(&alloc->threads, id);
 	if (t)
@@ -902,7 +906,7 @@ long sa_fork(uint64_t *stack_base)
 		copy_highpage(t->pagelist->pages[i], pt->pagelist->pages[i]);
 
 	t->stack_base = pt->stack_base;
-	shadow_addr = sa_shadow_addr(t->stack_base);
+	shadow_addr = shdwstck_addr(t->stack_base);
 	mmap_write_lock(mm);
 	err = map_range(mm, shadow_addr, shadow_addr + shdwstck_size,
 			t->pagelist);
@@ -988,7 +992,7 @@ long sa_pivot(uint64_t rsp, uint64_t new_stack_address)
 		goto err_unlock;
 	}
 
-	shadow_stack = sa_shadow_addr(new_start);
+	shadow_stack = shdwstck_addr(new_start);
 	err = map_range(mm, shadow_stack, shadow_stack + shdwstck_size,
 			thread->pagelist);
 	if (err)
@@ -1041,7 +1045,7 @@ err_alloc:
 static void sa_free_shadow_tables(struct mm_struct *mm)
 {
 	struct sa_tlb tlb = { .mm = mm,
-			      .batch = (struct sa_batch *)__get_free_page(
+			      .batch = (struct sa_batch *)get_zeroed_page(
 				      GFP_KERNEL) };
 
 	mmap_write_lock(mm);
@@ -1119,7 +1123,7 @@ long sa_prepare(uint64_t stack_base, bool detached)
 		return -EBUSY;
 	}
 
-	id = sa_stack_index(stack_base);
+	id = shdwstck_idx(stack_base);
 	err = xa_insert(&alloc->threads, id, NULL, GFP_KERNEL);
 	if (err == -EBUSY) {
 		sa_user_error("slot %lu already in use\n", id);
@@ -1240,7 +1244,7 @@ long sa_reclaim(uint64_t stack_base)
 	}
 
 	err = 0;
-	index = sa_stack_index(stack_base);
+	index = shdwstck_idx(stack_base);
 	xa_lock(&alloc->threads);
 	t = xa_load(&alloc->threads, index);
 	if (!t || t->state != SA_OWNED) {
@@ -1357,7 +1361,7 @@ long sa_unprepare(u64 stack_base)
 		return -EINVAL;
 	}
 
-	index = sa_stack_index(stack_base);
+	index = shdwstck_idx(stack_base);
 	xa_lock(&alloc->threads);
 	t = xa_load(&alloc->threads, index);
 	if (t) {
