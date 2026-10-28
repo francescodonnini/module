@@ -5,6 +5,10 @@ DEBUGFS_MOUNT_POINT = "/sys/kernel/debug"
 TARGET_PID_PATH = os.path.join(DEBUGFS_MOUNT_POINT, "ss_dbg", "target_pid")
 PGD_PATH = os.path.join(DEBUGFS_MOUNT_POINT, "ss_dbg", "pgd_hi")
 
+# 4-level paging: each PGD entry maps 2^39 bytes = 512 GiB
+PGDIR_SHIFT = 39
+GIB_PER_PGD_ENTRY = (1 << PGDIR_SHIFT) >> 30
+
 def get_all_pids():
     for dirname in os.listdir('/proc'):
         if dirname.isdigit():
@@ -98,10 +102,12 @@ def main():
         print("none (all kernel indices are populated)")
     else:
         for start, end in empty_ranges:
+            n = end - start + 1
+            size_gib = n * GIB_PER_PGD_ENTRY
             if start == end:
-                print(f"[{start:3d}]")
+                print(f"[{start:3d}] (Size: {size_gib} GiB)")
             else:
-                print(f"[{start:3d} - {end:3d}] (Size: {end - start + 1})")
+                print(f"[{start:3d} - {end:3d}] (Size: {n} entries, {size_gib} GiB)")
 
     if not divergent_pids:
         print("all scanned processes share the same non-empty upper PGD indices")
