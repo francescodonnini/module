@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "debug.h"
 #include <linux/debugfs.h>
 #include <linux/init.h>
 #include <linux/mm.h>
@@ -85,7 +84,7 @@ static const struct file_operations debug_fops = {
 	.release = single_release,
 };
 
-int debug_init(void)
+static int __init debug_init(void)
 {
 	debug_dir = debugfs_create_dir("ss_dbg", NULL);
 	if (IS_ERR(debug_dir)) {
@@ -99,7 +98,12 @@ int debug_init(void)
 	return 0;
 }
 
-void debug_exit(void)
+static void __exit debug_exit(void)
 {
 	debugfs_remove_recursive(debug_dir);
 }
+
+module_init(debug_init);
+module_exit(debug_exit);
+
+MODULE_LICENSE("GPL");
