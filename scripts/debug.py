@@ -9,6 +9,14 @@ PGD_PATH = os.path.join(DEBUGFS_MOUNT_POINT, "ss_dbg", "pgd_hi")
 PGDIR_SHIFT = 39
 TIB_PER_PGD_ENTRY = (1 << PGDIR_SHIFT) / (1 << 40)
 
+def pgd_index_to_addr(idx):
+    """Canonical virtual address of the first byte mapped by a PGD entry."""
+    addr = idx << PGDIR_SHIFT
+    if addr & (1 << 47):
+        addr |= 0xffff000000000000
+    return addr
+
+
 def get_all_pids():
     for dirname in os.listdir('/proc'):
         if dirname.isdigit():
@@ -104,10 +112,13 @@ def main():
         for start, end in empty_ranges:
             n = end - start + 1
             size_tib = n * TIB_PER_PGD_ENTRY
+            addr_start = pgd_index_to_addr(start)
+            addr_end = pgd_index_to_addr(end) + (1 << PGDIR_SHIFT) - 1
+            addrs = f"0x{addr_start:016x} - 0x{addr_end:016x}"
             if start == end:
-                print(f"[{start:3d}] (Size: {size_tib:g} TiB)")
+                print(f"[{start:3d}] {addrs} (Size: {size_tib:g} TiB)")
             else:
-                print(f"[{start:3d} - {end:3d}] (Size: {n} entries, {size_tib:g} TiB)")
+                print(f"[{start:3d} - {end:3d}] {addrs} (Size: {n} entries, {size_tib:g} TiB)")
 
     if not divergent_pids:
         print("all scanned processes share the same non-empty upper PGD indices")
