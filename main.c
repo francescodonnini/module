@@ -36,6 +36,7 @@ static void __exit runtime_exit(void)
 	debug_exit();
 	shdwstck_device_cleanup();
 	mmu_notifier_synchronize();
+	alloc_index_destroy();
 	vma_free();
 }
 

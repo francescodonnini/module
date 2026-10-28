@@ -40,6 +40,8 @@ long sa_init(void);
 
 struct sa_allocator_desc *alloc_create(struct mm_struct *mm);
 
+void alloc_index_destroy(void);
+
 long sa_alloc(u64 stack_base);
 
 long sa_detach(u64 stack_base);

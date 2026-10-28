@@ -52,7 +52,41 @@ module_param_named(debug_mask, sa_debug_mask, uint, 0644);
 static int gl_size;
 static LIST_HEAD(gl_sa);
 static DEFINE_SPINLOCK(gl_lock);
+
 static DEFINE_XARRAY(sa_allocators);
+
+static inline unsigned long alloc_key(const struct mm_struct *mm)
+{
+	return (unsigned long)mm;
+}
+
+static long alloc_link(struct sa_allocator_desc *alloc)
+{
+	long err;
+
+	err = xa_insert(&sa_allocators, alloc_key(alloc->mm), alloc,
+			GFP_KERNEL);
+	return err == -EBUSY ? -EEXIST : err;
+}
+
+static void alloc_unlink(struct sa_allocator_desc *alloc)
+{
+	void *old;
+
+	old = xa_erase(&sa_allocators, alloc_key(alloc->mm));
+	WARN_ON_ONCE(old != alloc);
+}
+
+static inline struct sa_allocator_desc *alloc_find(struct mm_struct *mm)
+{
+	return xa_load(&sa_allocators, alloc_key(mm));
+}
+
+void alloc_index_destroy(void)
+{
+	WARN_ON(!xa_empty(&sa_allocators));
+	xa_destroy(&sa_allocators);
+}
 
 #ifdef SHADOWSTACK_DEBUG
 #define SHDWSTCK_PARAM_PERM 0444
@@ -464,12 +498,12 @@ struct sa_allocator_desc *alloc_create(struct mm_struct *mm)
 	alloc->notifier.ops = &sa_mn_ops;
 	alloc->mm = mm;
 	xa_init(&alloc->threads);
-	err = xa_insert(&sa_allocators, (unsigned long)mm, alloc, GFP_KERNEL);
+	err = alloc_link(alloc);
 	if (err) {
-		if (err == -EBUSY)
+		if (err == -EEXIST)
 			sa_user_error("mm %p already has an allocator\n", mm);
 		else
-			sa_debug(SA_DEBUG_FAILED, "xa_insert failed: %ld\n",
+			sa_debug(SA_DEBUG_FAILED, "alloc_link failed: %ld\n",
 				 err);
 		goto err_free;
 	}
@@ -494,15 +528,10 @@ struct sa_allocator_desc *alloc_create(struct mm_struct *mm)
 err_module:
 	module_put(THIS_MODULE);
 err_erase:
-	xa_erase(&sa_allocators, (unsigned long)mm);
+	alloc_unlink(alloc);
 err_free:
 	kfree(alloc);
 	return ERR_PTR(err);
-}
-
-static inline struct sa_allocator_desc *alloc_find(struct mm_struct *mm)
-{
-	return xa_load(&sa_allocators, (unsigned long)mm);
 }
 
 static void unmap_pte_range(struct mm_struct *mm, pmd_t *pmd,
@@ -924,7 +953,7 @@ err_pages:
 	gl_free(t->pagelist);
 	t->pagelist = NULL;
 err_alloc:
-	xa_erase(&sa_allocators, (unsigned long)mm);
+	alloc_unlink(alloc);
 	mmu_notifier_put(&alloc->notifier);
 err_mmput:
 	sa_debug(SA_DEBUG_FAILED, "failed with error %ld\n", err);
@@ -1035,7 +1064,7 @@ err_unlock:
 	thread->pagelist = NULL;
 err_alloc:
 	sa_debug(SA_DEBUG_FAILED, "failer with error %ld\n", err);
-	xa_erase(&sa_allocators, (unsigned long)mm);
+	alloc_unlink(alloc);
 	mmu_notifier_put(&alloc->notifier);
 	return err;
 }
@@ -1063,7 +1092,7 @@ void sa_mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
 	alloc = container_of(mn, struct sa_allocator_desc, notifier);
 	sa_debug(SA_DEBUG_ALLOCATOR, "releasing allocator %p (mm %p)\n", alloc,
 		 mm);
-	xa_erase(&sa_allocators, (unsigned long)mm);
+	alloc_unlink(alloc);
 	sa_free_shadow_tables(mm);
 	if (alloc->main.pagelist)
 		gl_free(alloc->main.pagelist);
