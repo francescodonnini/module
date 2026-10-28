@@ -34,7 +34,7 @@ struct ioctl_prepare_params {
 	__s64 error;
 	__u64 stack_base;
 	__u32 detached;
-	__u32 __pad;
+	__u32 reserved;
 };
 
 struct ioctl_reclaim_dead_params {
