@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "api.h"
-#include "chrdev.h"
+#include "device.h"
 #include "uapi.h"
 #include <asm/errno.h>
 #include <linux/printk.h>
@@ -41,7 +41,7 @@ static long check_ioctl_cmd(unsigned int cmd)
 	return 0;
 }
 
-long chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+long shdwstck_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	void __user *user_arg = (void __user *)arg;
 	long err;

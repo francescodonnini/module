@@ -1,4 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _SHDWSTCK_COMPAT_H
+#define _SHDWSTCK_COMPAT_H
 #include <linux/gfp.h>
 #include <linux/mmzone.h>
 #include <linux/slab.h>
@@ -49,3 +51,4 @@ static inline unsigned long compat_alloc_pages_bulk(gfp_t gfp,
 	return alloc_pages_bulk(gfp, nr_pages, page_array);
 #endif
 }
+#endif

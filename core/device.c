@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "chrdev.h"
+#include "device.h"
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/device/class.h>
@@ -10,20 +10,20 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 
-#define DEVICE_NAME "shadowstack"
-#define DEVICE_CLASS "shadowstack_cls"
+#define DEVICE_NAME "shdwstck"
+#define DEVICE_CLASS "shdwstck_cls"
 
-struct bshadowstack_cdev {
+struct shdwstck_device {
 	dev_t dev;
 	struct cdev cdev;
 	struct class *class;
 };
 
-static struct bshadowstack_cdev device;
+static struct shdwstck_device device;
 
 static const struct file_operations ops = {
 	.owner = THIS_MODULE,
-	.unlocked_ioctl = chrdev_ioctl,
+	.unlocked_ioctl = shdwstck_ioctl,
 };
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
@@ -47,16 +47,16 @@ static ssize_t session_show(struct device *dev, struct device_attribute *attr,
 
 DEVICE_ATTR(active, 0440, session_show, NULL);
 
-static struct attribute *bshadowstack_dev_attrs[] = {
+static struct attribute *shdwstck_device_attrs[] = {
 	&dev_attr_active.attr,
 	NULL,
 };
 
-ATTRIBUTE_GROUPS(bshadowstack_dev);
+ATTRIBUTE_GROUPS(shdwstck_device);
 
-/// @brief Registers the "shadowstack" char-based device (at /dev/shadostack) and the class "shadowstack_cls"
+/// @brief Registers the "shdwstck" char-based device (at /dev/shdwstck) and the class "shdwstck_cls"
 /// @return
-int chrdev_init(void)
+int shdwstck_device_init(void)
 {
 	int err;
 	struct class *device_class;
@@ -94,7 +94,7 @@ int chrdev_init(void)
 	device.class = device_class;
 
 	dp = device_create_with_groups(device.class, NULL, device.dev, NULL,
-				       bshadowstack_dev_groups, DEVICE_NAME);
+				       shdwstck_device_groups, DEVICE_NAME);
 	if (IS_ERR(dp)) {
 		err = PTR_ERR(dp);
 		pr_err("cannot create device /dev/%s, got error %d",
@@ -114,7 +114,7 @@ out:
 	return err;
 }
 
-void chrdev_cleanup(void)
+void shdwstck_device_cleanup(void)
 {
 	device_destroy(device.class, device.dev);
 	class_destroy(device.class);

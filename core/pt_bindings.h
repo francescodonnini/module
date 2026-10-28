@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef LK_PT_BINDINGS_H
-#define LK_PT_BINDINGS_H
+#ifndef _SHDWSTCK_PT_BINDINGS_H
+#define _SHDWSTCK_PT_BINDINGS_H
 #include <linux/mm.h>
 #include <linux/version.h>
 
@@ -173,5 +173,4 @@ static inline void my_p4d_free(struct mm_struct *mm, p4d_t *p4d)
 	p4d_free(mm, p4d);
 }
 #endif
-
 #endif

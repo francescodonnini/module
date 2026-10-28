@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "api.h"
-#include "chrdev.h"
 #include "debug.h"
+#include "device.h"
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/printk.h>
@@ -23,7 +23,7 @@ static int __init runtime_init(void)
 		return err;
 
 	debug_init();
-	err = chrdev_init();
+	err = shdwstck_device_init();
 	if (err) {
 		debug_exit();
 	}
@@ -34,7 +34,7 @@ static int __init runtime_init(void)
 static void __exit runtime_exit(void)
 {
 	debug_exit();
-	chrdev_cleanup();
+	shdwstck_device_cleanup();
 	mmu_notifier_synchronize();
 	vma_free();
 }

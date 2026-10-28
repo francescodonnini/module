@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef LKM_API_H
-#define LKM_API_H
+#ifndef _SHDWSTCK_API_H
+#define _SHDWSTCK_API_H
 #include <linux/list.h>
 #include <linux/mm_types.h>
 #include <linux/mmu_notifier.h>
