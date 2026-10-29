@@ -111,7 +111,7 @@ unsigned long shdwstck_end __ro_after_init;
 unsigned long shdwstck_delta __ro_after_init;
 
 #define shdwstck_addr(stack_base) (stack_base + shdwstck_delta)
-#define shdwstck_idx(b) (((b) - shdwstck_start) / shdwstck_size)
+#define shdwstck_idx(b) (((b) - shdwstck_user_start) / shdwstck_size)
 
 struct sa_batch {
 	unsigned int nr;
