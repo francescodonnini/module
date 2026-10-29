@@ -928,7 +928,8 @@ long sa_fork(uint64_t *stack_base)
 	if (err)
 		goto err_alloc;
 
-	for (i = 0; i < pt->pagelist->nr_pages; ++i)
+	for (i = (current_pt_regs()->sp - pt->stack_base) >> PAGE_SHIFT;
+	     i < pt->pagelist->nr_pages; ++i)
 		copy_highpage(t->pagelist->pages[i], pt->pagelist->pages[i]);
 
 	t->stack_base = pt->stack_base;
