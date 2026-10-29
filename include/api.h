@@ -17,6 +17,7 @@ enum sa_thread_state {
 struct sa_pagelist {
 	int nr_pages;
 	struct page **pages;
+	unsigned long *dirty;
 	struct list_head list; // gl_sa
 };
 

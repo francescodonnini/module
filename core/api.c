@@ -4,6 +4,7 @@
 #include "api.h"
 #include "compat.h"
 #include "pt_bindings.h"
+#include <linux/bitmap.h>
 #include <linux/compiler_attributes.h>
 #include <linux/highmem.h>
 #include <linux/io.h>
@@ -171,6 +172,7 @@ static inline void sa_pagelist_free_pages(struct sa_pagelist *pagelist)
 static inline void sa_pagelist_free(struct sa_pagelist *pagelist)
 {
 	sa_pagelist_free_pages(pagelist);
+	bitmap_free(pagelist->dirty);
 	kfree(pagelist);
 }
 
@@ -311,6 +313,13 @@ static long gl_alloc_stack(struct sa_pagelist **p)
 		kfree(pagelist);
 		return err;
 	}
+	pagelist->dirty = bitmap_zalloc(nr_pages, GFP_KERNEL);
+	if (!pagelist->dirty) {
+		sa_debug(SA_DEBUG_FAILED, "cannot allocate pagelist bitmap");
+		sa_pagelist_free_pages(pagelist);
+		kfree(pagelist);
+		return -ENOMEM;
+	}
 
 	*p = pagelist;
 	return 0;
@@ -332,9 +341,12 @@ static void gl_free(struct sa_pagelist *pagelist)
 		return;
 	}
 
-	for (i = 0; i < pagelist->nr_pages; ++i)
+	sa_debug(SA_DEBUG_FREELIST, "clearing %u dirty pages\n",
+		 bitmap_weight(pagelist->dirty, pagelist->nr_pages));
+	for_each_set_bit(i, pagelist->dirty, pagelist->nr_pages)
 		clear_highpage(pagelist->pages[i]);
 
+	bitmap_zero(pagelist->dirty, pagelist->nr_pages);
 	spin_lock(&gl_lock);
 	size = ++gl_size;
 	list_add(&pagelist->list, &gl_sa);
@@ -535,19 +547,27 @@ err_free:
 }
 
 static void unmap_pte_range(struct mm_struct *mm, pmd_t *pmd,
-			    unsigned long addr, unsigned long end)
+			    unsigned long addr, unsigned long end,
+			    unsigned long start, struct sa_pagelist *pl)
 {
 	pte_t *pte = pte_offset_kernel(pmd, addr);
 
 	do {
-		if (!pte_none(ptep_get(pte)))
-			pte_clear(mm, addr, pte);
+		pte_t old;
+
+		if (pte_none(ptep_get(pte)))
+			continue;
+
+		old = ptep_get_and_clear(mm, addr, pte);
+		if (pl && pte_dirty(old))
+			set_bit((addr - start) >> PAGE_SHIFT, pl->dirty);
 
 	} while (pte++, addr += PAGE_SIZE, addr != end);
 }
 
 static void unmap_pmd_range(struct mm_struct *mm, pud_t *pud,
-			    unsigned long addr, unsigned long end)
+			    unsigned long addr, unsigned long end,
+			    unsigned long start, struct sa_pagelist *pl)
 {
 	pmd_t *pmd = pmd_offset(pud, addr);
 	unsigned long next;
@@ -557,12 +577,13 @@ static void unmap_pmd_range(struct mm_struct *mm, pud_t *pud,
 		if (pmd_none(*pmd) || pmd_bad(*pmd))
 			continue;
 
-		unmap_pte_range(mm, pmd, addr, next);
+		unmap_pte_range(mm, pmd, addr, next, start, pl);
 	} while (pmd++, addr = next, addr != end);
 }
 
 static void unmap_pud_range(struct mm_struct *mm, p4d_t *p4d,
-			    unsigned long addr, unsigned long end)
+			    unsigned long addr, unsigned long end,
+			    unsigned long start, struct sa_pagelist *pl)
 {
 	pud_t *pud = pud_offset(p4d, addr);
 	unsigned long next;
@@ -572,12 +593,13 @@ static void unmap_pud_range(struct mm_struct *mm, p4d_t *p4d,
 		if (pud_none(*pud) || pud_bad(*pud))
 			continue;
 
-		unmap_pmd_range(mm, pud, addr, next);
+		unmap_pmd_range(mm, pud, addr, next, start, pl);
 	} while (pud++, addr = next, addr != end);
 }
 
 static void unmap_p4d_range(struct mm_struct *mm, pgd_t *pgd,
-			    unsigned long addr, unsigned long end)
+			    unsigned long addr, unsigned long end,
+			    unsigned long start, struct sa_pagelist *pl)
 {
 	p4d_t *p4d = p4d_offset(pgd, addr);
 	unsigned long next;
@@ -587,7 +609,7 @@ static void unmap_p4d_range(struct mm_struct *mm, pgd_t *pgd,
 		if (p4d_none(*p4d) || p4d_bad(*p4d))
 			continue;
 
-		unmap_pud_range(mm, p4d, addr, next);
+		unmap_pud_range(mm, p4d, addr, next, start, pl);
 	} while (p4d++, addr = next, addr != end);
 }
 
@@ -601,7 +623,7 @@ static void unmap_p4d_range(struct mm_struct *mm, pgd_t *pgd,
  * Context: Process context, assumes mmap_write_lock() is held.
  */
 static inline void unmap_range(struct mm_struct *mm, uint64_t addr,
-			       uint64_t end)
+			       uint64_t end, struct sa_pagelist *pl)
 {
 	unsigned long start = addr, next;
 	pgd_t *pgd;
@@ -614,7 +636,7 @@ static inline void unmap_range(struct mm_struct *mm, uint64_t addr,
 		if (pgd_none(*pgd) || pgd_bad(*pgd))
 			continue;
 
-		unmap_p4d_range(mm, pgd, addr, next);
+		unmap_p4d_range(mm, pgd, addr, next, start, pl);
 	} while (pgd++, addr = next, addr != end);
 
 	__flush_tlb_mm_range_bnd(mm, start, end, PAGE_SHIFT, false);
@@ -731,7 +753,7 @@ static long map_range(struct mm_struct *mm, unsigned long addr,
 			 end, addr, err);
 		// If something goes wrong, we don't remove the tables already allocated because they can be re-used in the future
 		// by another thread that recycles the virtual address (and by adjacent threads too)
-		unmap_range(mm, start, next);
+		unmap_range(mm, start, next, NULL);
 	}
 
 	sa_debug(SA_DEBUG_PGTABLE, "mapped [%lx-%lx)\n", start, end);
@@ -880,7 +902,7 @@ long sa_fork(uint64_t *stack_base)
 	struct mm_struct *mm, *parent_mm;
 	struct sa_allocator_desc *alloc, *pa;
 	struct sa_thread_desc *t, *pt;
-	int i;
+	int i, first;
 	long err;
 	unsigned long shadow_addr;
 
@@ -928,10 +950,11 @@ long sa_fork(uint64_t *stack_base)
 	if (err)
 		goto err_alloc;
 
-	for (i = (current_pt_regs()->sp - pt->stack_base) >> PAGE_SHIFT;
-	     i < pt->pagelist->nr_pages; ++i)
+	first = (current_pt_regs()->sp - pt->stack_base) >> PAGE_SHIFT;
+	for (i = first; i < pt->pagelist->nr_pages; ++i)
 		copy_highpage(t->pagelist->pages[i], pt->pagelist->pages[i]);
 
+	bitmap_set(t->pagelist->dirty, first, t->pagelist->nr_pages - first);
 	t->stack_base = pt->stack_base;
 	shadow_addr = shdwstck_addr(t->stack_base);
 	mmap_write_lock(mm);
@@ -1070,13 +1093,31 @@ err_alloc:
 	return err;
 }
 
-static void sa_free_shadow_tables(struct mm_struct *mm)
+static void sa_collect_dirty(struct mm_struct *mm, struct sa_thread_desc *t)
 {
+	unsigned long shadow;
+
+	if (!t->pagelist)
+		return;
+
+	shadow = shdwstck_addr(t->stack_base);
+	unmap_range(mm, shadow, shadow + shdwstck_size, t->pagelist);
+}
+
+static void sa_free_shadow_tables(struct mm_struct *mm,
+				  struct sa_allocator_desc *alloc)
+{
+	struct sa_thread_desc *t;
+	unsigned long tid;
 	struct sa_tlb tlb = { .mm = mm,
 			      .batch = (struct sa_batch *)get_zeroed_page(
 				      GFP_KERNEL) };
 
 	mmap_write_lock(mm);
+	sa_collect_dirty(mm, &alloc->main);
+	xa_for_each(&alloc->threads, tid, t)
+		sa_collect_dirty(mm, t);
+
 	my_free_pgd_range(&tlb, shdwstck_start, shdwstck_end);
 	mmap_write_unlock(mm);
 	sa_debug(SA_DEBUG_TLB, "tlb finish [%lx-%lx) mm %p\n", shdwstck_start,
@@ -1094,7 +1135,7 @@ void sa_mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
 	sa_debug(SA_DEBUG_ALLOCATOR, "releasing allocator %p (mm %p)\n", alloc,
 		 mm);
 	alloc_unlink(alloc);
-	sa_free_shadow_tables(mm);
+	sa_free_shadow_tables(mm, alloc);
 	if (alloc->main.pagelist)
 		gl_free(alloc->main.pagelist);
 
@@ -1233,7 +1274,7 @@ static void sa_desc_release_list(struct list_head *list)
 	list_for_each_entry(t, list, list) {
 		unsigned long shadow = shdwstck_addr(t->stack_base);
 
-		unmap_range(mm, shadow, shadow + shdwstck_size);
+		unmap_range(mm, shadow, shadow + shdwstck_size, t->pagelist);
 	}
 
 	mmap_write_unlock(mm);
