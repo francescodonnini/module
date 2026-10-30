@@ -2,7 +2,7 @@
 #ifndef _SHDWSTCK_PT_BINDINGS_H
 #define _SHDWSTCK_PT_BINDINGS_H
 #include <linux/mm.h>
-#include <linux/pgalloc.h>
+#include <asm/pgalloc.h>
 #include <linux/version.h>
 
 typedef int (*__p4d_alloc_t)(struct mm_struct *, pgd_t *, unsigned long);
