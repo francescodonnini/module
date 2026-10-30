@@ -111,64 +111,23 @@ static inline void my_pagetable_free(struct ptdesc *pt)
 		__pagetable_free(pt);
 	}
 }
-
-static inline void my_pagetable_dtor_free(struct ptdesc *ptdesc)
-{
-	pagetable_dtor(ptdesc);
-	my_pagetable_free(ptdesc);
-}
-
-static inline void my_pte_free(struct mm_struct *mm, struct page *pte_page)
-{
-	struct ptdesc *ptdesc;
-
-	ptdesc = page_ptdesc(pte_page);
-	my_pagetable_dtor_free(ptdesc);
-}
-
-static inline void my_pmd_free(struct mm_struct *mm, pmd_t *pmd)
-{
-	struct ptdesc *ptdesc;
-
-	ptdesc = page_ptdesc(virt_to_page(pmd));
-	my_pagetable_dtor_free(ptdesc);
-}
-
-static inline void my_pud_free(struct mm_struct *mm, pud_t *pud)
-{
-	struct ptdesc *ptdesc;
-
-	ptdesc = page_ptdesc(virt_to_page(pud));
-	my_pagetable_dtor_free(ptdesc);
-}
-
-static inline void my_p4d_free(struct mm_struct *mm, p4d_t *p4d)
-{
-	struct ptdesc *ptdesc;
-
-	ptdesc = page_ptdesc(virt_to_page(p4d));
-	my_pagetable_dtor_free(ptdesc);
-}
-
-#else
-static inline void my_pte_free(struct mm_struct *mm, struct page *pte_page)
-{
-	pte_free(mm, pte_page);
-}
-
-static inline void my_pmd_free(struct mm_struct *mm, pmd_t *pmd)
-{
-	pmd_free(mm, pmd);
-}
-
-static inline void my_pud_free(struct mm_struct *mm, pud_t *pud)
-{
-	pud_free(mm, pud);
-}
-
-static inline void my_p4d_free(struct mm_struct *mm, p4d_t *p4d)
-{
-	p4d_free(mm, p4d);
-}
 #endif
+
+static inline void sa_free_table_page(struct page *page)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 7)
+	struct ptdesc *pt = page_ptdesc(page);
+
+	if (PageTable(page))
+		pagetable_dtor(pt);
+	my_pagetable_free(pt);
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+	if (PageTable(page))
+		pgtable_pte_page_dtor(page); /* uguale per PTE e PMD sul 5.x */
+	__free_page(page);
+#else
+#error "sa_free_table_page: kernel version not supported"
+#endif
+}
+
 #endif

@@ -126,6 +126,11 @@ struct sa_tlb {
 	struct sa_batch *batch;
 };
 
+static inline void sa_tlb_remove_table(pgtable_t table)
+{
+	sa_free_table_page(table);
+}
+
 static void sa_tlb_add(struct sa_tlb *tlb, pgtable_t page)
 {
 	struct sa_batch **batch = &tlb->batch;
@@ -134,7 +139,7 @@ static void sa_tlb_add(struct sa_tlb *tlb, pgtable_t page)
 		*batch = (struct sa_batch *)__get_free_page(GFP_NOWAIT);
 		if (!*batch) {
 			my_flush_tlb_mm(tlb->mm);
-			__free_page(page);
+			sa_tlb_remove_table(page);
 			return;
 		}
 
@@ -147,7 +152,7 @@ static void sa_tlb_add(struct sa_tlb *tlb, pgtable_t page)
 
 		my_flush_tlb_mm(tlb->mm);
 		for (i = 0; i < (*batch)->nr; ++i)
-			__free_page((*batch)->tables[i]);
+			sa_tlb_remove_table((*batch)->tables[i]);
 
 		(*batch)->nr = 0;
 	}
@@ -464,7 +469,7 @@ static void my_free_pgd_range(struct sa_tlb *tlb, unsigned long addr,
 
 		my_flush_tlb_mm(tlb->mm);
 		for (i = 0; i < tlb->batch->nr; ++i)
-			__free_page(tlb->batch->tables[i]);
+			sa_tlb_remove_table(tlb->batch->tables[i]);
 	}
 
 	if (tlb->batch)
