@@ -6,20 +6,12 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+#define COMPAT_MAX_ORDER (MAX_ORDER - 1)
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 #define COMPAT_MAX_ORDER MAX_ORDER
 #else
 #define COMPAT_MAX_ORDER MAX_PAGE_ORDER
-#endif
-
-#ifndef kmalloc_array
-#define kmalloc_array(n, size, flags)                              \
-	({                                                         \
-		size_t bytes;                                      \
-		if (unlikely(check_mul_overflow(n, size, &bytes))) \
-			return NULL;                               \
-		return kmalloc(bytes, flags);                      \
-	})
 #endif
 
 #ifndef kmalloc_obj
@@ -51,4 +43,16 @@ static inline unsigned long compat_alloc_pages_bulk(gfp_t gfp,
 	return alloc_pages_bulk(gfp, nr_pages, page_array);
 #endif
 }
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
+static inline void vm_flags_set(struct vm_area_struct *vma, vm_flags_t flags)
+{
+	vma->vm_flags |= flags;
+}
+
+static inline void vm_flags_clear(struct vm_area_struct *vma, vm_flags_t flags)
+{
+	vma->vm_flags &= ~flags;
+}
+#endif
 #endif

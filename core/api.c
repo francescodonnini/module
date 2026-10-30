@@ -14,6 +14,7 @@
 #include <linux/pgtable.h>
 #include <linux/ptrace.h>
 #include <linux/printk.h>
+#include <linux/sched/task_stack.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/types.h>

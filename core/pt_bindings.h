@@ -2,6 +2,7 @@
 #ifndef _SHDWSTCK_PT_BINDINGS_H
 #define _SHDWSTCK_PT_BINDINGS_H
 #include <linux/mm.h>
+#include <linux/pgalloc.h>
 #include <linux/version.h>
 
 typedef int (*__p4d_alloc_t)(struct mm_struct *, pgd_t *, unsigned long);
@@ -152,10 +153,7 @@ static inline void my_p4d_free(struct mm_struct *mm, p4d_t *p4d)
 #else
 static inline void my_pte_free(struct mm_struct *mm, struct page *pte_page)
 {
-	struct ptdesc *ptdesc;
-
-	ptdesc = page_ptdesc(pte_page);
-	pagetable_dtor_free(ptdesc);
+	pte_free(mm, pte_page);
 }
 
 static inline void my_pmd_free(struct mm_struct *mm, pmd_t *pmd)
