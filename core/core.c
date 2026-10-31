@@ -330,6 +330,10 @@ static void free_pmd_range(struct sa_gather *g, pud_t *pud, unsigned long addr,
 	pmd = pmd_offset(pud, addr);
 	do {
 		next = pmd_addr_end(addr, end);
+		if (!pmd_none(*pmd))
+			sa_debug(SA_DEBUG_PGTABLE, "pmd %lx = %lx\n", addr,
+				 (unsigned long)pmd_val(*pmd));
+
 		if (pmd_none(*pmd) || pmd_bad(*pmd))
 			continue;
 
@@ -353,6 +357,10 @@ static void free_pud_range(struct sa_gather *g, p4d_t *p4d, unsigned long addr,
 	pud = pud_offset(p4d, addr);
 	do {
 		next = pud_addr_end(addr, end);
+		if (!pud_none(*pud))
+			sa_debug(SA_DEBUG_PGTABLE, "pud %lx = %lx\n", addr,
+				 (unsigned long)pud_val(*pud));
+
 		if (pud_none(*pud) || pud_bad(*pud))
 			continue;
 
@@ -376,6 +384,8 @@ static void free_p4d_range(struct sa_gather *g, pgd_t *pgd, unsigned long addr,
 	p4d = p4d_offset(pgd, addr);
 	do {
 		next = p4d_addr_end(addr, end);
+		sa_debug(SA_DEBUG_PGTABLE, "p4d %lx = %lx\n", addr,
+			 (unsigned long)p4d_val(*p4d));
 		if (p4d_none(*p4d) || p4d_bad(*p4d))
 			continue;
 
@@ -744,6 +754,38 @@ static struct page *sa_lookup_shadow_page(struct mm_struct *mm,
 	return page;
 }
 
+/**
+ * sa_area_p4d - Returns the top-level entry covering @addr in the shadow area.
+ * With 4-level paging p4d_offset() returns the pgd entry itself, so this works
+ * for both 4 and 5 levels (pgd_none() is always 0 with 4 levels, p4d_none() is not).
+ */
+static inline p4d_t *sa_area_p4d(struct mm_struct *mm, unsigned long addr)
+{
+	return p4d_offset(pgd_offset(mm, addr), addr);
+}
+
+/**
+ * sa_area_empty - Checks that no top-level entry of the shadow area is populated
+ * in @mm, i.e. the module is the only one that will ever allocate tables there.
+ */
+static bool sa_area_empty(struct mm_struct *mm)
+{
+	unsigned long a;
+
+	for (a = shdwstck_start; a < shdwstck_end;
+	     a = p4d_addr_end(a, shdwstck_end)) {
+		p4d_t *p4d = sa_area_p4d(mm, a);
+
+		if (!p4d_none(*p4d)) {
+			sa_debug(SA_DEBUG_FAILED,
+				 "shadow area not empty: p4d %lx = %lx\n", a,
+				 (unsigned long)p4d_val(*p4d));
+			return false;
+		}
+	}
+	return true;
+}
+
 static unsigned long sa_free_shadow_area(struct mm_struct *mm)
 {
 	struct sa_gather g = { .mm = mm };
@@ -771,6 +813,7 @@ long sa_fork(u64 *stack_base)
 	u64 nr, shadow, sp;
 	struct page **ppages;
 	int i, first, from_parent, copied, extra;
+	bool empty;
 	long err;
 
 	mm = current->mm;
@@ -807,6 +850,15 @@ long sa_fork(u64 *stack_base)
 	if (IS_ERR(alloc)) {
 		err = PTR_ERR(alloc);
 		goto err_mmput;
+	}
+
+	mmap_read_lock(mm);
+	empty = sa_area_empty(mm);
+	mmap_read_unlock(mm);
+	if (!empty) {
+		/* not our tables: do not free anything */
+		err = -EBUSY;
+		goto err_alloc;
 	}
 
 	nr = shdwstck_size >> PAGE_SHIFT;
@@ -926,6 +978,12 @@ long sa_pivot(u64 rsp, u64 new_stack_address, u64 *sa_delta)
 
 	thread = &alloc->main;
 	mmap_write_lock(mm);
+	if (!sa_area_empty(mm)) {
+		/* not our tables: do not free anything */
+		err = -EBUSY;
+		goto err_unlock_nofree;
+	}
+
 	old_area = find_vma(mm, rsp);
 	if (!old_area || old_area->vm_start > rsp) {
 		sa_user_error("no_vma for rsp %llx\n", rsp);
@@ -968,6 +1026,8 @@ long sa_pivot(u64 rsp, u64 new_stack_address, u64 *sa_delta)
 	}
 
 	sa_debug(SA_DEBUG_PAGES, "pivot: %ld shadow pages installed\n", n);
+	sa_debug(SA_DEBUG_PGTABLE, "pivot: area p4d after install %lx\n",
+		 (unsigned long)p4d_val(*sa_area_p4d(mm, shdwstck_start)));
 	old_start = old_area->vm_start;
 	old_len = old_area->vm_end - old_area->vm_start;
 	mmap_write_unlock(mm);
@@ -1004,6 +1064,11 @@ long sa_pivot(u64 rsp, u64 new_stack_address, u64 *sa_delta)
 err_unlock:
 	mmap_write_unlock(mm);
 	sa_free_shadow_area(mm);
+	goto err_out;
+
+err_unlock_nofree:
+	mmap_write_unlock(mm);
+err_out:
 	sa_debug(SA_DEBUG_FAILED, "failed with error %ld\n", err);
 	alloc_unlink(alloc);
 	mmu_notifier_put(&alloc->notifier);
