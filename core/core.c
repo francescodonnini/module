@@ -2,6 +2,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "core.h"
+#include "compat.h"
 #include "pt_bindings.h"
 #include <linux/compiler_attributes.h>
 #include <linux/gfp.h>
