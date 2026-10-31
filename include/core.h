@@ -27,6 +27,8 @@ struct sa_allocator_desc {
 	struct xarray threads;
 	struct sa_thread_desc main;
 	struct mmu_notifier notifier;
+	long fork_err;
+	bool ready;
 	atomic_long_t shadow_installed;
 	atomic_long_t shadow_freed;
 };
@@ -41,7 +43,9 @@ long sa_alloc(u64 stack_base);
 
 long sa_detach(u64 stack_base);
 
-long sa_fork(u64 *stack_base);
+long sa_fork_child(u64 *stack_base);
+
+long sa_fork_parent(pid_t cp);
 
 long sa_pivot(u64 rsp, u64 new_stack_address, u64 *sa_delta);
 

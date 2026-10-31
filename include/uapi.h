@@ -8,7 +8,8 @@
 
 enum {
 	IOCTL_SHADOW_ALLOC_NO = 0x70,
-	IOCTL_SHADOW_FORK_NO,
+	IOCTL_SHADOW_FORK_CHILD_NO,
+	IOCTL_SHADOW_FORK_PARENT_NO,
 	IOCTL_SHADOW_DETACH_NO,
 	IOCTL_SHADOW_PIVOT_NO,
 	IOCTL_SHADOW_PREPARE_NO,
@@ -18,9 +19,10 @@ enum {
 	IOCTL_SHADOW_MAX_NR
 };
 
-struct ioctl_stack_params {
+struct ioctl_fork_params {
 	__s64 error;
-	__u64 stack_base;
+	__s32 child;
+	__u32 reserved;
 };
 
 struct ioctl_pivot_params {
@@ -44,15 +46,23 @@ struct ioctl_reclaim_dead_params {
 	__u32 count;
 };
 
+struct ioctl_stack_params {
+	__s64 error;
+	__u64 stack_base;
+};
+
 #define IOCTL_SHADOW_ALLOC                               \
 	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_ALLOC_NO, \
 	      struct ioctl_stack_params)
 #define IOCTL_SHADOW_DETACH                               \
 	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_DETACH_NO, \
 	      struct ioctl_stack_params)
-#define IOCTL_SHADOW_FORK                               \
-	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_FORK_NO, \
+#define IOCTL_SHADOW_FORK_CHILD                               \
+	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_FORK_CHILD_NO, \
 	      struct ioctl_stack_params)
+#define IOCTL_SHADOW_FORK_PARENT                               \
+	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_FORK_PARENT_NO, \
+	      struct ioctl_fork_params)
 #define IOCTL_SHADOW_PIVOT                               \
 	_IOWR(IOCTL_SHADOW_MAGIC, IOCTL_SHADOW_PIVOT_NO, \
 	      struct ioctl_pivot_params)

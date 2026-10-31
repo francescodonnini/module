@@ -38,7 +38,8 @@ static long check_ioctl_cmd(unsigned int cmd)
 	switch (cmd) {
 	case IOCTL_SHADOW_ALLOC:
 	case IOCTL_SHADOW_DETACH:
-	case IOCTL_SHADOW_FORK:
+	case IOCTL_SHADOW_FORK_CHILD:
+	case IOCTL_SHADOW_FORK_PARENT:
 	case IOCTL_SHADOW_PIVOT:
 	case IOCTL_SHADOW_PREPARE:
 	case IOCTL_SHADOW_RECLAIM:
@@ -80,13 +81,25 @@ static long shdwstck_ioctl(struct file *file, unsigned int cmd,
 
 		break;
 	}
-	case IOCTL_SHADOW_FORK: {
+	case IOCTL_SHADOW_FORK_CHILD: {
 		struct ioctl_stack_params req;
 
 		if (copy_from_user(&req, user_arg, sizeof(req)))
 			return -EFAULT;
 
-		req.error = sa_fork(&req.stack_base);
+		req.error = sa_fork_child(&req.stack_base);
+		if (copy_to_user(user_arg, &req, sizeof(req)))
+			return -EFAULT;
+
+		break;
+	}
+	case IOCTL_SHADOW_FORK_PARENT: {
+		struct ioctl_fork_params req;
+
+		if (copy_from_user(&req, user_arg, sizeof(req)))
+			return -EFAULT;
+
+		req.error = sa_fork_parent(req.child);
 		if (copy_to_user(user_arg, &req, sizeof(req)))
 			return -EFAULT;
 

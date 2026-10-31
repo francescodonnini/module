@@ -20,6 +20,7 @@
 #include <linux/types.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
+#include <linux/wait.h>
 
 enum {
 	SA_DEBUG_USER_ERROR = 1U << 0,
@@ -116,6 +117,8 @@ struct sa_batch {
 	void *batch[];
 };
 #define MAX_BATCH_SIZE ((PAGE_SIZE - sizeof(struct sa_batch)) / sizeof(void *))
+
+static DECLARE_WAIT_QUEUE_HEAD(sa_fork_wq);
 
 struct sa_gather {
 	struct mm_struct *mm;
@@ -226,15 +229,25 @@ static int sa_install_shadow_page(struct sa_allocator_desc *alloc,
 	pte_t *pte;
 	int ret = 0;
 
-	if (!page) {
-		page = alloc_page(GFP_KERNEL | __GFP_ZERO);
-		if (!page)
-			return -ENOMEM;
-	}
-
 	pmd = sa_walk_alloc_pmd(mm, shadow);
 	if (!pmd || my_pte_alloc(mm, pmd))
 		goto nomem;
+
+	if (!page) {
+		pte = my_pte_offset_map_lock(mm, pmd, shadow, &ptl);
+		if (!pte)
+			goto nomem;
+		ret = pte_none(ptep_get(pte));
+		pte_unmap_unlock(pte, ptl);
+		if (!ret)
+			return 0;
+
+		page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!page)
+			return -ENOMEM;
+
+		ret = 0;
+	}
 
 	pte = my_pte_offset_map_lock(mm, pmd, shadow, &ptl);
 	if (!pte)
@@ -256,7 +269,9 @@ static int sa_install_shadow_page(struct sa_allocator_desc *alloc,
 	return ret;
 
 nomem:
-	__free_page(page);
+	if (page)
+		__free_page(page);
+
 	return -ENOMEM;
 }
 
@@ -798,76 +813,94 @@ static unsigned long sa_free_shadow_area(struct mm_struct *mm)
 	return g.nr_freed;
 }
 
-/**
- * sa_fork - Creates a new shadow area mapping for the current calling thread by duplicating the parent thread's shadow stack.
- *
- * Context: Process context, it issues a TLB shootdown for the current process.
- * Returns 0 on success, <0 otherwise.
- */
-long sa_fork(u64 *stack_base)
+static inline bool sa_fork_ready(struct mm_struct *mm,
+				 struct sa_allocator_desc **out)
 {
-	struct task_struct *parent;
-	struct mm_struct *mm, *parent_mm;
-	struct sa_allocator_desc *alloc, *pa;
-	struct sa_thread_desc *t, *pt;
-	u64 nr, shadow, sp;
-	struct page **ppages;
-	int i, first, from_parent, copied, extra;
-	bool empty;
-	long err;
+	struct sa_allocator_desc *a = alloc_find(mm);
+	if (!a || !smp_load_acquire(&a->ready))
+		return false;
 
-	mm = current->mm;
-	if (!mm)
+	*out = a;
+	return true;
+}
+
+long sa_fork_child(u64 *stack_base)
+{
+	struct sa_allocator_desc *alloc;
+	u64 sp, top, addr;
+	long ret;
+
+	ret = wait_event_killable_timeout(
+		sa_fork_wq, sa_fork_ready(current->mm, &alloc), 5 * HZ);
+	if (!ret)
+		return -ETIMEDOUT;
+
+	if (ret < 0)
+		return ret;
+
+	if (alloc->fork_err)
+		return alloc->fork_err;
+
+	sp = current_pt_regs()->sp;
+	top = alloc->main.stack_base + shdwstck_size;
+	if (sp < alloc->main.stack_base || sp >= top)
 		return -EINVAL;
 
+	mmap_read_lock(current->mm);
+	for (addr = ALIGN_DOWN(sp, PAGE_SIZE); addr < top && ret >= 0;
+	     addr += PAGE_SIZE)
+		ret = sa_install_shadow_page(alloc, shdwstck_addr(addr), NULL);
+	mmap_read_unlock(current->mm);
+	if (ret < 0)
+		return ret;
+
+	*stack_base = alloc->main.stack_base;
+	return 0;
+}
+
+static struct task_struct *sa_get_child(pid_t p)
+{
+	struct task_struct *child;
+	bool mine;
+
+	child = get_pid_task(find_vpid(p), PIDTYPE_PID);
+	if (!child)
+		return ERR_PTR(-ESRCH);
+
 	rcu_read_lock();
-	parent = rcu_dereference(current->real_parent);
-	get_task_struct(parent);
+	mine = same_thread_group(rcu_dereference(child->real_parent), current);
 	rcu_read_unlock();
-	parent_mm = get_task_mm(parent);
-	put_task_struct(parent);
-	if (!parent_mm) {
-		sa_user_error("parent has no mm\n");
-		return -ESRCH;
+	if (!mine || child->mm == current->mm) {
+		put_task_struct(child);
+		return ERR_PTR(-EPERM);
 	}
 
-	pa = alloc_find(parent_mm);
-	if (!pa) {
-		sa_user_error("no allocator for parent mm %p\n", parent_mm);
-		err = -ENOENT;
-		goto err_mmput;
-	}
+	return child;
+}
 
-	pt = desc_by_sp(pa, current_pt_regs()->sp);
-	if (!pt || pt->state != SA_OWNED) {
-		sa_user_error("sp %lx not on an owned parent stack\n",
-			      current_pt_regs()->sp);
-		err = -ENOENT;
-		goto err_mmput;
-	}
+/* Context: mmap_read_lock(mm) held */
+static bool sa_has_stack(struct mm_struct *mm, u64 stack_base)
+{
+	struct vm_area_struct *vma = find_vma(mm, stack_base);
+	return vma && vma->vm_start == stack_base &&
+	       vma->vm_end == stack_base + shdwstck_size &&
+	       vma->vm_ops == &sa_stack_vm_ops;
+}
 
-	alloc = alloc_create(current->mm);
-	if (IS_ERR(alloc)) {
-		err = PTR_ERR(alloc);
-		goto err_mmput;
-	}
+static long sa_copy_shadow(struct mm_struct *parent_mm,
+			   struct sa_allocator_desc *alloc, u64 stack_base,
+			   u64 sp)
+{
+	u64 shadow = shdwstck_addr(stack_base);
+	unsigned long nr = shdwstck_size >> PAGE_SHIFT;
+	unsigned long first = (sp - stack_base) >> PAGE_SHIFT;
+	struct page **ppages;
+	int i, from_parent = 0, copied = 0;
+	long err = 0;
 
-	mmap_read_lock(mm);
-	empty = sa_area_empty(mm);
-	mmap_read_unlock(mm);
-	if (!empty) {
-		/* not our tables: do not free anything */
-		err = -EBUSY;
-		goto err_alloc;
-	}
-
-	nr = shdwstck_size >> PAGE_SHIFT;
-	shadow = shdwstck_addr(pt->stack_base);
 	ppages = kvcalloc(nr, sizeof(*ppages), GFP_KERNEL);
-	if (!ppages) {
-		err = -ENOMEM;
-		goto err_alloc;
-	}
+	if (!ppages)
+		return -ENOMEM;
 
 	mmap_read_lock(parent_mm);
 	for (i = 0; i < nr; ++i)
@@ -875,13 +908,7 @@ long sa_fork(u64 *stack_base)
 						  shadow + i * PAGE_SIZE);
 
 	mmap_read_unlock(parent_mm);
-	t = &alloc->main;
-	t->stack_base = pt->stack_base;
-	first = (current_pt_regs()->sp - pt->stack_base) >> PAGE_SHIFT;
-	err = 0;
-	from_parent = 0;
-	copied = 0;
-	mmap_write_lock(mm);
+	mmap_write_lock(alloc->mm);
 	for (i = 0; i < nr && err >= 0; ++i) {
 		struct page *page;
 
@@ -904,48 +931,87 @@ long sa_fork(u64 *stack_base)
 		if (err > 0)
 			from_parent += err;
 	}
-
-	extra = 0;
-	sp = current_pt_regs()->sp;
-	for (i = (ALIGN_DOWN(sp, PAGE_SIZE) - pt->stack_base) >> PAGE_SHIFT;
-	     i < nr && err >= 0; ++i) {
-		if (!ppages[i]) {
-			err = sa_install_shadow_page(
-				alloc, shadow + i * PAGE_SIZE, NULL);
-			if (err > 0)
-				extra += err;
-		}
-	}
-
-	mmap_write_unlock(mm);
-	sa_debug(SA_DEBUG_PAGES,
-		 "fork: %d from parent (%d copied), %d extra below parent\n",
-		 from_parent, copied, extra);
+	mmap_write_unlock(alloc->mm);
 	for (i = 0; i < nr; ++i)
 		if (ppages[i])
 			put_page(ppages[i]);
 
 	kvfree(ppages);
-	if (err < 0)
-		goto err_shadow;
+	if (err < 0) {
+		sa_debug(SA_DEBUG_FAILED, "failed with error %ld\n", err);
+		return err;
+	}
 
-	t->owner = get_pid(task_pid(current));
-	t->state = SA_OWNED;
-	*stack_base = t->stack_base;
 	sa_debug(SA_DEBUG_FORK,
-		 "copied stack %llx (%d pages) from parent mm %p\n",
-		 t->stack_base, copied, parent_mm);
-	mmput(parent_mm);
+		 "fork: %d pages from parent mm %p (%d copied)\n", from_parent,
+		 parent_mm, copied);
 	return 0;
+}
 
-err_shadow:
-	sa_free_shadow_area(mm);
-err_alloc:
-	alloc_unlink(alloc);
-	mmu_notifier_put(&alloc->notifier);
-err_mmput:
-	sa_debug(SA_DEBUG_FAILED, "failed with error %ld\n", err);
-	mmput(parent_mm);
+long sa_fork_parent(pid_t cp)
+{
+	struct task_struct *child;
+	struct mm_struct *mm, *child_mm;
+	struct sa_allocator_desc *alloc, *pa;
+	struct sa_thread_desc *pt;
+	long err;
+
+	mm = current->mm;
+	if (!mm)
+		return -EINVAL;
+
+	pa = alloc_find(mm);
+	if (!pa)
+		return -ENOENT;
+
+	pt = desc_by_sp(pa, current_pt_regs()->sp);
+	if (!pt || pt->state != SA_OWNED)
+		return -ENOENT;
+
+	child = sa_get_child(cp);
+	if (IS_ERR(child))
+		return PTR_ERR(child);
+
+	child_mm = get_task_mm(child);
+	if (!child_mm) {
+		err = -ESRCH;
+		goto out_task;
+	}
+
+	if (alloc_find(child_mm)) {
+		err = -EEXIST;
+		goto out_mm;
+	}
+
+	mmap_read_lock(child_mm);
+	err = (sa_area_empty(child_mm) &&
+	       sa_has_stack(child_mm, pt->stack_base)) ?
+		      0 :
+		      -EINVAL;
+	mmap_read_unlock(child_mm);
+	if (err)
+		goto out_mm;
+
+	alloc = alloc_create(child_mm);
+	if (IS_ERR(alloc)) {
+		err = PTR_ERR(alloc);
+		goto out_mm;
+	}
+
+	err = sa_copy_shadow(mm, alloc, pt->stack_base, current_pt_regs()->sp);
+	if (!err) {
+		alloc->main.stack_base = pt->stack_base;
+		alloc->main.owner = get_pid(task_pid(child));
+		alloc->main.state = SA_OWNED;
+	}
+
+	alloc->fork_err = err;
+	smp_store_release(&alloc->ready, true);
+	wake_up_all(&sa_fork_wq);
+out_mm:
+	mmput(child_mm);
+out_task:
+	put_task_struct(child);
 	return err;
 }
 
