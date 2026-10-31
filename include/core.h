@@ -1,12 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef _SHDWSTCK_API_H
-#define _SHDWSTCK_API_H
+#ifndef _SHDWSTCK_CORE_H
+#define _SHDWSTCK_CORE_H
 #include <linux/list.h>
 #include <linux/mm_types.h>
 #include <linux/mmu_notifier.h>
 #include <linux/sched/mm.h>
 #include <linux/spinlock.h>
-#include <linux/types.h>
+#include <linux/version.h>
 #include <linux/xarray.h>
 
 enum sa_thread_state {
@@ -14,19 +14,11 @@ enum sa_thread_state {
 	SA_PREPARED,
 };
 
-struct sa_pagelist {
-	int nr_pages;
-	struct page **pages;
-	unsigned long *dirty;
-	struct list_head list; // gl_sa
-};
-
 struct sa_thread_desc {
-	uint64_t stack_base;
+	u64 stack_base;
 	enum sa_thread_state state;
 	bool detached;
 	struct pid *owner;
-	struct sa_pagelist *pagelist;
 	struct list_head list;
 };
 
@@ -35,6 +27,8 @@ struct sa_allocator_desc {
 	struct xarray threads;
 	struct sa_thread_desc main;
 	struct mmu_notifier notifier;
+	atomic_long_t shadow_installed;
+	atomic_long_t shadow_freed;
 };
 
 long sa_init(void);
@@ -61,6 +55,16 @@ long sa_unprepare(u64 stack_base);
 
 long resolve_symbols(void);
 
-void vma_free(void);
+void sa_exit(void);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#define SA_HAVE_MMAP_PREPARE 1
+#endif
+
+#if SA_HAVE_MMAP_PREPARE
+int sa_mmap_prepare(struct vm_area_desc *desc);
+#else
+int sa_mmap(struct file *file, struct vm_area_struct *vma);
+#endif
 
 #endif

@@ -4,10 +4,8 @@
 #include <linux/fs.h>
 #include <linux/types.h>
 
-int shdwstck_device_init(void);
+int sa_device_init(void);
 
-void shdwstck_device_cleanup(void);
-
-long shdwstck_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+void sa_device_cleanup(void);
 
 #endif

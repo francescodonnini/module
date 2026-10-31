@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "api.h"
+#include "core.h"
 #include "device.h"
 #include <linux/init.h>
 #include <linux/module.h>
@@ -21,15 +21,15 @@ static int __init runtime_init(void)
 	if (err)
 		return err;
 
-	return shdwstck_device_init();
+	return sa_device_init();
 }
 
 static void __exit runtime_exit(void)
 {
-	shdwstck_device_cleanup();
+	sa_device_cleanup();
 	mmu_notifier_synchronize();
 	alloc_index_destroy();
-	vma_free();
+	sa_exit();
 }
 
 MODULE_AUTHOR("Francesco Donnini <donnini.francesco00@gmail.com>");

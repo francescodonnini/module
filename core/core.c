@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-#include "api.h"
-#include "compat.h"
+#include "core.h"
 #include "pt_bindings.h"
-#include <linux/bitmap.h>
 #include <linux/compiler_attributes.h>
+#include <linux/gfp.h>
 #include <linux/highmem.h>
 #include <linux/io.h>
 #include <linux/mm.h>
@@ -35,12 +34,12 @@ enum {
 	SA_DEBUG_TLB = 1U << 10,
 };
 
-#define sa_debug(mask, fmt, ...)                                              \
-	do {                                                                  \
-		if (unlikely(sa_debug_mask & (mask)))                         \
-			pr_info_ratelimited("%d:%d %s:%d" fmt, current->tgid, \
-					    current->pid, __func__, __LINE__, \
-					    ##__VA_ARGS__);                   \
+#define sa_debug(mask, fmt, ...)                                               \
+	do {                                                                   \
+		if (unlikely(sa_debug_mask & (mask)))                          \
+			pr_info_ratelimited("%d:%d %s:%d " fmt, current->tgid, \
+					    current->pid, __func__, __LINE__,  \
+					    ##__VA_ARGS__);                    \
 	} while (0)
 
 #define sa_user_error(fmt, ...) \
@@ -49,12 +48,6 @@ enum {
 static u32 sa_debug_mask = SA_DEBUG_USER_ERROR | SA_DEBUG_FAILED;
 module_param_named(debug_mask, sa_debug_mask, uint, 0644);
 
-#define GL_SA_CAPACITY (16)
-
-static int gl_size;
-static LIST_HEAD(gl_sa);
-static DEFINE_SPINLOCK(gl_lock);
-
 static DEFINE_XARRAY(sa_allocators);
 
 static inline unsigned long alloc_key(const struct mm_struct *mm)
@@ -62,7 +55,7 @@ static inline unsigned long alloc_key(const struct mm_struct *mm)
 	return (unsigned long)mm;
 }
 
-static long alloc_link(struct sa_allocator_desc *alloc)
+static inline long alloc_link(struct sa_allocator_desc *alloc)
 {
 	long err;
 
@@ -71,7 +64,7 @@ static long alloc_link(struct sa_allocator_desc *alloc)
 	return err == -EBUSY ? -EEXIST : err;
 }
 
-static void alloc_unlink(struct sa_allocator_desc *alloc)
+static inline void alloc_unlink(struct sa_allocator_desc *alloc)
 {
 	void *old;
 
@@ -115,47 +108,81 @@ unsigned long shdwstck_delta __ro_after_init;
 #define shdwstck_addr(stack_base) (stack_base + shdwstck_delta)
 #define shdwstck_idx(b) (((b) - shdwstck_user_start) / shdwstck_size)
 
+static struct page *sa_zero_page;
+
 struct sa_batch {
 	unsigned int nr;
-	void *tables[];
+	void *batch[];
 };
 #define MAX_BATCH_SIZE ((PAGE_SIZE - sizeof(struct sa_batch)) / sizeof(void *))
 
-struct sa_tlb {
+struct sa_gather {
 	struct mm_struct *mm;
-	struct sa_batch *batch;
+	struct sa_batch *tables;
+	struct sa_batch *pages;
+	unsigned long nr_freed;
 };
 
-static inline void sa_tlb_remove_table(pgtable_t table)
+/**
+ * sa_gather_flush - flushes the tlb and frees all the pages gathered earlier.
+ */
+static void sa_gather_flush(struct sa_gather *g)
 {
-	sa_free_table_page(table);
+	unsigned i;
+
+	if (!(g->pages && g->pages->nr) && !(g->tables && g->tables->nr))
+		return;
+
+	my_flush_tlb_mm(g->mm);
+	if (g->pages) {
+		for (i = 0; i < g->pages->nr; ++i)
+			__free_page(g->pages->batch[i]);
+
+		g->pages->nr = 0;
+	}
+
+	if (g->tables) {
+		for (i = 0; i < g->tables->nr; ++i)
+			sa_free_table_page(g->tables->batch[i]);
+
+		g->tables->nr = 0;
+	}
 }
 
-static void sa_tlb_add(struct sa_tlb *tlb, pgtable_t page)
+static void sa_gather_add(struct sa_gather *g, struct sa_batch **b,
+			  struct page *page, bool table)
 {
-	struct sa_batch **batch = &tlb->batch;
+	if (!*b) {
+		*b = (struct sa_batch *)__get_free_page(GFP_NOWAIT);
+		if (!*b) {
+			my_flush_tlb_mm(g->mm);
+			if (table)
+				sa_free_table_page(page);
+			else
+				__free_page(page);
 
-	if (!*batch) {
-		*batch = (struct sa_batch *)__get_free_page(GFP_NOWAIT);
-		if (!*batch) {
-			my_flush_tlb_mm(tlb->mm);
-			sa_tlb_remove_table(page);
 			return;
 		}
 
-		(*batch)->nr = 0;
+		(*b)->nr = 0;
 	}
 
-	(*batch)->tables[(*batch)->nr++] = page;
-	if ((*batch)->nr == MAX_BATCH_SIZE) {
-		int i;
+	(*b)->batch[(*b)->nr++] = page;
+	if ((*b)->nr == MAX_BATCH_SIZE)
+		sa_gather_flush(g);
+}
 
-		my_flush_tlb_mm(tlb->mm);
-		for (i = 0; i < (*batch)->nr; ++i)
-			sa_tlb_remove_table((*batch)->tables[i]);
+#define sa_gather_page(g, p) sa_gather_add(g, &(g)->pages, p, false)
+#define sa_gather_table(g, p) sa_gather_add(g, &(g)->tables, p, true)
 
-		(*batch)->nr = 0;
-	}
+static void sa_gather_finish(struct sa_gather *g)
+{
+	sa_gather_flush(g);
+	if (g->pages)
+		free_page((unsigned long)g->pages);
+
+	if (g->tables)
+		free_page((unsigned long)g->tables);
 }
 
 void sa_mn_release(struct mmu_notifier *mn, struct mm_struct *mm);
@@ -166,213 +193,132 @@ static const struct mmu_notifier_ops sa_mn_ops = {
 	.free_notifier = sa_mn_free,
 };
 
-static inline void sa_pagelist_free_pages(struct sa_pagelist *pagelist)
+static pmd_t *sa_walk_alloc_pmd(struct mm_struct *mm, unsigned long addr)
 {
-	while (pagelist->nr_pages--)
-		__free_page(pagelist->pages[pagelist->nr_pages]);
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
 
-	kvfree(pagelist->pages);
-	pagelist->pages = NULL;
-}
-
-static inline void sa_pagelist_free(struct sa_pagelist *pagelist)
-{
-	sa_pagelist_free_pages(pagelist);
-	bitmap_free(pagelist->dirty);
-	kfree(pagelist);
-}
-
-/**
- * sa_pagelist_alloc_pages - Allocates `nr_pages` pages and saves them in `pagelist`. The page array in pagelist can contain
- * up to `npages` 0-order pages.
- * @gfp: describes the allocation context.
- * @nr_pages: number of 0-order pages to allocate.
- * @pagelist: pagelist to fill with the allocated pages.
- *
- * Returns 0 on success, <0 otherwise.
- */
-static long sa_pagelist_alloc_pages(gfp_t gfp, unsigned long nr_pages,
-				    struct sa_pagelist *pagelist)
-{
-	unsigned long nr_allocated;
-	unsigned long nr_remaining;
-	unsigned long nr_high = 0, nr_bulk = 0, nr_single = 0;
-	unsigned int max_attempt_order;
-	struct page *page;
-	int i;
-	unsigned int large_order;
-
-	pagelist->pages = kvcalloc(nr_pages, sizeof(struct page *), GFP_KERNEL);
-	if (!pagelist->pages) {
-		sa_debug(SA_DEBUG_FAILED,
-			 "pagelist: cannot allocate page array (%lu entries)\n",
-			 nr_pages);
-		return -ENOMEM;
+	pgd = pgd_offset(mm, addr);
+	p4d = my_p4d_alloc(mm, pgd, addr);
+	if (!p4d) {
+		sa_debug(SA_DEBUG_PGTABLE | SA_DEBUG_FAILED,
+			 "cannot allocate p4d table page\n");
+		return NULL;
 	}
 
-	nr_allocated = 0;
-	max_attempt_order = COMPAT_MAX_ORDER;
-	nr_remaining = nr_pages;
-	large_order =
-		min_t(unsigned int, max_attempt_order, ilog2(nr_remaining));
-	while (large_order > 0 && nr_remaining) {
-		// Try to get high order pages without triggering a reclaim if no pages
-		// are available
-		page = alloc_pages((gfp | __GFP_NOWARN) & ~__GFP_DIRECT_RECLAIM,
-				   large_order);
-		if (unlikely(!page)) {
-			max_attempt_order = --large_order;
+	pud = my_pud_alloc(mm, p4d, addr);
+	if (!pud) {
+		sa_debug(SA_DEBUG_PGTABLE | SA_DEBUG_FAILED,
+			 "cannot allocate pud table page\n");
+		return NULL;
+	}
+	return my_pmd_alloc(mm, pud, addr);
+}
+
+static int sa_install_shadow_page(struct sa_allocator_desc *alloc,
+				  unsigned long shadow, struct page *page)
+{
+	struct mm_struct *mm = alloc->mm;
+	spinlock_t *ptl;
+	pmd_t *pmd;
+	pte_t *pte;
+	int ret = 0;
+
+	if (!page) {
+		page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!page)
+			return -ENOMEM;
+	}
+
+	pmd = sa_walk_alloc_pmd(mm, shadow);
+	if (!pmd || my_pte_alloc(mm, pmd))
+		goto nomem;
+
+	pte = my_pte_offset_map_lock(mm, pmd, shadow, &ptl);
+	if (!pte)
+		goto nomem;
+
+	if (pte_none(ptep_get(pte))) {
+		set_pte_at(mm, shadow, pte, mk_pte(page, PAGE_SHARED));
+		page = NULL;
+		ret = 1;
+	}
+
+	pte_unmap_unlock(pte, ptl);
+	if (page)
+		__free_page(page);
+
+	if (ret)
+		atomic_long_inc(&alloc->shadow_installed);
+
+	return ret;
+
+nomem:
+	__free_page(page);
+	return -ENOMEM;
+}
+
+static vm_fault_t sa_stack_fault(struct vm_fault *vmf)
+{
+	struct mm_struct *mm = vmf->vma->vm_mm;
+	struct sa_allocator_desc *alloc = alloc_find(mm);
+	u64 addr = (vmf->address & PAGE_MASK);
+	int ret = 0;
+
+	if (alloc) {
+		ret = sa_install_shadow_page(alloc, addr + shdwstck_delta,
+					     NULL);
+		if (ret < 0)
+			return VM_FAULT_OOM;
+	}
+
+	sa_debug(SA_DEBUG_PAGES, "fault %llx: shadow %s\n", addr,
+		 !alloc ? "skipped (no allocator)" :
+		 ret	? "installed" :
+			  "already present");
+	get_page(sa_zero_page);
+	vmf->page = sa_zero_page;
+	return 0;
+}
+
+static const struct vm_operations_struct sa_stack_vm_ops = {
+	.fault = sa_stack_fault,
+};
+
+static void unmap_pte_range(struct sa_gather *g, pmd_t *pmd, unsigned long addr,
+			    unsigned long end)
+{
+	pte_t *pte = pte_offset_kernel(pmd, addr);
+
+	do {
+		pte_t old;
+
+		if (pte_none(ptep_get(pte)))
 			continue;
+
+		old = ptep_get_and_clear(g->mm, addr, pte);
+		if (pte_present(old)) {
+			sa_gather_page(g, pte_page(old));
+			g->nr_freed++;
 		}
 
-		split_page(page, large_order);
-		for (i = 0; i < (1U << large_order); ++i)
-			pagelist->pages[nr_allocated + i] = page + i;
-
-		nr_allocated += 1U << large_order;
-		nr_high += 1U << large_order;
-		nr_remaining = nr_pages - nr_allocated;
-		large_order = min_t(unsigned int, max_attempt_order,
-				    ilog2(nr_remaining));
-	}
-
-	while (nr_allocated < nr_pages) {
-		unsigned int nr;
-		unsigned int nr_pages_request;
-
-		nr_pages_request = min(100UL, nr_pages - nr_allocated);
-		nr = compat_alloc_pages_bulk(gfp, nr_pages_request,
-					     pagelist->pages + nr_allocated);
-		nr_allocated += nr;
-		nr_bulk += nr;
-		if (nr != nr_pages_request)
-			break;
-	}
-
-	while (nr_allocated < nr_pages) {
-		// If previous requests have failed becase of an OOM signal,
-		// it's useless to retry more allocation requests
-		if (fatal_signal_pending(current))
-			break;
-
-		page = alloc_pages(gfp, 0);
-		if (unlikely(!page))
-			break;
-
-		pagelist->pages[nr_allocated++] = page;
-		nr_single++;
-	}
-
-	pagelist->nr_pages = nr_allocated;
-	sa_debug(
-		SA_DEBUG_PAGES,
-		"pagelist: %lu/%lu pages (high-order %lu, bulk %lu, order-0 %lu)\n",
-		nr_allocated, nr_pages, nr_high, nr_bulk, nr_single);
-	if (nr_allocated != nr_pages) {
-		sa_debug(SA_DEBUG_FAILED,
-			 "pagelist: only %lu/%lu pages allocated\n",
-			 nr_allocated, nr_pages);
-		sa_pagelist_free_pages(pagelist);
-		return -ENOMEM;
-	}
-	return 0;
+	} while (pte++, addr += PAGE_SIZE, addr != end);
 }
 
-/**
- * gl_alloc_stack - Allocates enough 0-order pages to contain a shadow stack or recycles an old one not currently used
- * (put in a free list). The underlying pages are zeroed before returning the address to the caller.
- * @pagelist: pagelist to fill with the allocated pages.
- *
- * Returns: 0 on success, <0 otherwise.
- */
-static long gl_alloc_stack(struct sa_pagelist **p)
-{
-	struct sa_pagelist *pagelist;
-	unsigned long nr_pages;
-	int size;
-	long err;
-
-	spin_lock(&gl_lock);
-	pagelist = list_first_entry_or_null(&gl_sa, struct sa_pagelist, list);
-	if (pagelist) {
-		size = --gl_size;
-		list_del(&pagelist->list);
-		spin_unlock(&gl_lock);
-		sa_debug(SA_DEBUG_FREELIST, "freelist hit (%d left)\n", size);
-		*p = pagelist;
-		return 0;
-	}
-
-	spin_unlock(&gl_lock);
-	sa_debug(SA_DEBUG_FREELIST, "freelist miss, allocation new stack\n");
-	pagelist = kmalloc_obj(*pagelist, GFP_KERNEL);
-	if (!pagelist) {
-		sa_debug(SA_DEBUG_FAILED,
-			 "cannot allocate pagelist descriptor");
-		return -ENOMEM;
-	}
-
-	nr_pages = shdwstck_size >> PAGE_SHIFT;
-	err = sa_pagelist_alloc_pages(GFP_KERNEL | __GFP_ZERO, nr_pages,
-				      pagelist);
-	if (err) {
-		kfree(pagelist);
-		return err;
-	}
-	pagelist->dirty = bitmap_zalloc(nr_pages, GFP_KERNEL);
-	if (!pagelist->dirty) {
-		sa_debug(SA_DEBUG_FAILED, "cannot allocate pagelist bitmap");
-		sa_pagelist_free_pages(pagelist);
-		kfree(pagelist);
-		return -ENOMEM;
-	}
-
-	*p = pagelist;
-	return 0;
-}
-
-/**
- * gl_free - Tries to add a kernel memory regione to the global free list so other threads can reuse it.
- * The insertion might fail if the free list is full, in this case the pages will be released.
- */
-static void gl_free(struct sa_pagelist *pagelist)
-{
-	int i, size;
-
-	if (gl_size >= GL_SA_CAPACITY) {
-		sa_debug(SA_DEBUG_FREELIST,
-			 "freelist full, releasing %d pages\n",
-			 pagelist->nr_pages);
-		sa_pagelist_free(pagelist);
-		return;
-	}
-
-	sa_debug(SA_DEBUG_FREELIST, "clearing %u dirty pages\n",
-		 bitmap_weight(pagelist->dirty, pagelist->nr_pages));
-	for_each_set_bit(i, pagelist->dirty, pagelist->nr_pages)
-		clear_highpage(pagelist->pages[i]);
-
-	bitmap_zero(pagelist->dirty, pagelist->nr_pages);
-	spin_lock(&gl_lock);
-	size = ++gl_size;
-	list_add(&pagelist->list, &gl_sa);
-	spin_unlock(&gl_lock);
-	sa_debug(SA_DEBUG_FREELIST, "pagelist recycled (%d in freelist)\n",
-		 size);
-}
-
-static void free_pte_range(struct sa_tlb *tlb, pmd_t *pmd, unsigned long addr,
+static void free_pte_range(struct sa_gather *g, pmd_t *pmd, unsigned long addr,
 			   unsigned long end)
 {
 	pgtable_t pte;
 
+	unmap_pte_range(g, pmd, addr, end);
 	pte = pmd_pgtable(*pmd);
 	pmd_clear(pmd);
-	sa_tlb_add(tlb, pte);
-	mm_dec_nr_ptes(tlb->mm);
+	sa_gather_table(g, pte);
+	mm_dec_nr_ptes(g->mm);
 }
 
-static void free_pmd_range(struct sa_tlb *tlb, pud_t *pud, unsigned long addr,
+static void free_pmd_range(struct sa_gather *g, pud_t *pud, unsigned long addr,
 			   unsigned long end)
 {
 	pmd_t *pmd;
@@ -386,16 +332,16 @@ static void free_pmd_range(struct sa_tlb *tlb, pud_t *pud, unsigned long addr,
 		if (pmd_none(*pmd) || pmd_bad(*pmd))
 			continue;
 
-		free_pte_range(tlb, pmd, addr, next);
+		free_pte_range(g, pmd, addr, next);
 	} while (pmd++, addr = next, addr != end);
 
 	pmd = pmd_offset(pud, start);
 	pud_clear(pud);
-	sa_tlb_add(tlb, virt_to_page(pmd));
-	mm_dec_nr_pmds(tlb->mm);
+	sa_gather_table(g, virt_to_page(pmd));
+	mm_dec_nr_pmds(g->mm);
 }
 
-static void free_pud_range(struct sa_tlb *tlb, p4d_t *p4d, unsigned long addr,
+static void free_pud_range(struct sa_gather *g, p4d_t *p4d, unsigned long addr,
 			   unsigned long end)
 {
 	pud_t *pud;
@@ -409,16 +355,16 @@ static void free_pud_range(struct sa_tlb *tlb, p4d_t *p4d, unsigned long addr,
 		if (pud_none(*pud) || pud_bad(*pud))
 			continue;
 
-		free_pmd_range(tlb, pud, addr, next);
+		free_pmd_range(g, pud, addr, next);
 	} while (pud++, addr = next, addr != end);
 
 	pud = pud_offset(p4d, start);
 	p4d_clear(p4d);
-	sa_tlb_add(tlb, virt_to_page(pud));
-	mm_dec_nr_puds(tlb->mm);
+	sa_gather_table(g, virt_to_page(pud));
+	mm_dec_nr_puds(g->mm);
 }
 
-static void free_p4d_range(struct sa_tlb *tlb, pgd_t *pgd, unsigned long addr,
+static void free_p4d_range(struct sa_gather *g, pgd_t *pgd, unsigned long addr,
 			   unsigned long end)
 {
 	p4d_t *p4d;
@@ -432,7 +378,7 @@ static void free_p4d_range(struct sa_tlb *tlb, pgd_t *pgd, unsigned long addr,
 		if (p4d_none(*p4d) || p4d_bad(*p4d))
 			continue;
 
-		free_pud_range(tlb, p4d, addr, next);
+		free_pud_range(g, p4d, addr, next);
 	} while (p4d++, addr = next, addr != end);
 
 	if (!pgtable_l5_enabled())
@@ -440,47 +386,38 @@ static void free_p4d_range(struct sa_tlb *tlb, pgd_t *pgd, unsigned long addr,
 
 	p4d = p4d_offset(pgd, start);
 	pgd_clear(pgd);
-	sa_tlb_add(tlb, virt_to_page(p4d));
+	sa_gather_table(g, virt_to_page(p4d));
 }
 
 /**
  * my_free_pgd_range - Unmaps and frees page tables in the range [addr, end).
  */
-static void my_free_pgd_range(struct sa_tlb *tlb, unsigned long addr,
+static void my_free_pgd_range(struct sa_gather *g, unsigned long addr,
 			      unsigned long end)
 {
 	pgd_t *pgd;
 	unsigned long next;
 
-	mmap_assert_write_locked(tlb->mm);
+	mmap_assert_write_locked(g->mm);
 	sa_debug(SA_DEBUG_PGTABLE, "freeing page tables [%lx-%lx) mm %p\n",
-		 addr, end, tlb->mm);
-	pgd = pgd_offset(tlb->mm, addr);
+		 addr, end, g->mm);
+	pgd = pgd_offset(g->mm, addr);
 	do {
 		next = pgd_addr_end(addr, end);
 		if (pgd_none(*pgd) || pgd_bad(*pgd))
 			continue;
 
-		free_p4d_range(tlb, pgd, addr, next);
+		free_p4d_range(g, pgd, addr, next);
 	} while (pgd++, addr = next, addr != end);
-
-	if (tlb->batch && tlb->batch->nr > 0) {
-		int i;
-
-		my_flush_tlb_mm(tlb->mm);
-		for (i = 0; i < tlb->batch->nr; ++i)
-			sa_tlb_remove_table(tlb->batch->tables[i]);
-	}
-
-	if (tlb->batch)
-		__free_page((struct page *)tlb->batch);
 }
 
 long sa_init(void)
 {
 	if (!shdwstck_start || !shdwstck_user_start || !shdwstck_size ||
 	    !shdwstck_area_size) {
-		pr_err("stack_size, area_size, user_stack_start e shadow_stack_start are mandatory\n");
+		sa_debug(
+			SA_DEBUG_FAILED,
+			"stack_size, area_size, user_stack_start e shadow_stack_start are mandatory\n");
 		return -EINVAL;
 	}
 
@@ -499,7 +436,20 @@ long sa_init(void)
 
 	shdwstck_end = shdwstck_start + shdwstck_area_size;
 	shdwstck_delta = shdwstck_start - shdwstck_user_start;
+
+	sa_zero_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+	if (!sa_zero_page) {
+		sa_debug(SA_DEBUG_FAILED, "cannot allocate zero page\n");
+		return -ENOMEM;
+	}
+
 	return 0;
+}
+
+void sa_exit(void)
+{
+	if (sa_zero_page)
+		__free_page(sa_zero_page);
 }
 
 struct sa_allocator_desc *alloc_create(struct mm_struct *mm)
@@ -552,28 +502,8 @@ err_free:
 	return ERR_PTR(err);
 }
 
-static void unmap_pte_range(struct mm_struct *mm, pmd_t *pmd,
-			    unsigned long addr, unsigned long end,
-			    unsigned long start, struct sa_pagelist *pl)
-{
-	pte_t *pte = pte_offset_kernel(pmd, addr);
-
-	do {
-		pte_t old;
-
-		if (pte_none(ptep_get(pte)))
-			continue;
-
-		old = ptep_get_and_clear(mm, addr, pte);
-		if (pl && pte_dirty(old))
-			set_bit((addr - start) >> PAGE_SHIFT, pl->dirty);
-
-	} while (pte++, addr += PAGE_SIZE, addr != end);
-}
-
-static void unmap_pmd_range(struct mm_struct *mm, pud_t *pud,
-			    unsigned long addr, unsigned long end,
-			    unsigned long start, struct sa_pagelist *pl)
+static void unmap_pmd_range(struct sa_gather *g, pud_t *pud, unsigned long addr,
+			    unsigned long end)
 {
 	pmd_t *pmd = pmd_offset(pud, addr);
 	unsigned long next;
@@ -583,13 +513,12 @@ static void unmap_pmd_range(struct mm_struct *mm, pud_t *pud,
 		if (pmd_none(*pmd) || pmd_bad(*pmd))
 			continue;
 
-		unmap_pte_range(mm, pmd, addr, next, start, pl);
+		unmap_pte_range(g, pmd, addr, next);
 	} while (pmd++, addr = next, addr != end);
 }
 
-static void unmap_pud_range(struct mm_struct *mm, p4d_t *p4d,
-			    unsigned long addr, unsigned long end,
-			    unsigned long start, struct sa_pagelist *pl)
+static void unmap_pud_range(struct sa_gather *g, p4d_t *p4d, unsigned long addr,
+			    unsigned long end)
 {
 	pud_t *pud = pud_offset(p4d, addr);
 	unsigned long next;
@@ -599,13 +528,12 @@ static void unmap_pud_range(struct mm_struct *mm, p4d_t *p4d,
 		if (pud_none(*pud) || pud_bad(*pud))
 			continue;
 
-		unmap_pmd_range(mm, pud, addr, next, start, pl);
+		unmap_pmd_range(g, pud, addr, next);
 	} while (pud++, addr = next, addr != end);
 }
 
-static void unmap_p4d_range(struct mm_struct *mm, pgd_t *pgd,
-			    unsigned long addr, unsigned long end,
-			    unsigned long start, struct sa_pagelist *pl)
+static void unmap_p4d_range(struct sa_gather *g, pgd_t *pgd, unsigned long addr,
+			    unsigned long end)
 {
 	p4d_t *p4d = p4d_offset(pgd, addr);
 	unsigned long next;
@@ -615,7 +543,7 @@ static void unmap_p4d_range(struct mm_struct *mm, pgd_t *pgd,
 		if (p4d_none(*p4d) || p4d_bad(*p4d))
 			continue;
 
-		unmap_pud_range(mm, p4d, addr, next, start, pl);
+		unmap_pud_range(g, p4d, addr, next);
 	} while (p4d++, addr = next, addr != end);
 }
 
@@ -628,142 +556,21 @@ static void unmap_p4d_range(struct mm_struct *mm, pgd_t *pgd,
  *
  * Context: Process context, assumes mmap_write_lock() is held.
  */
-static inline void unmap_range(struct mm_struct *mm, uint64_t addr,
-			       uint64_t end, struct sa_pagelist *pl)
+static inline void unmap_range(struct sa_gather *g, u64 addr, u64 end)
 {
-	unsigned long start = addr, next;
+	unsigned long next;
 	pgd_t *pgd;
 
-	mmap_assert_write_locked(mm);
-	sa_debug(SA_DEBUG_PGTABLE, "unmapping [%lx-%llx)\n", start, end);
-	pgd = pgd_offset(mm, addr);
+	mmap_assert_write_locked(g->mm);
+	sa_debug(SA_DEBUG_PGTABLE, "unmapping [%llx-%llx)\n", addr, end);
+	pgd = pgd_offset(g->mm, addr);
 	do {
 		next = pgd_addr_end(addr, end);
 		if (pgd_none(*pgd) || pgd_bad(*pgd))
 			continue;
 
-		unmap_p4d_range(mm, pgd, addr, next, start, pl);
+		unmap_p4d_range(g, pgd, addr, next);
 	} while (pgd++, addr = next, addr != end);
-
-	__flush_tlb_mm_range_bnd(mm, start, end, PAGE_SHIFT, false);
-}
-
-static long map_pte_range(struct mm_struct *mm, pmd_t *pmd, uint64_t addr,
-			  uint64_t end, unsigned long start,
-			  struct sa_pagelist *pages)
-{
-	pte_t *pte;
-
-	if (my_pte_alloc(mm, pmd))
-		return -ENOMEM;
-
-	pte = pte_offset_kernel(pmd, addr);
-	do {
-		struct page *page;
-
-		page = pages->pages[(addr - start) >> PAGE_SHIFT];
-		set_pte_at(mm, addr, pte, mk_pte(page, PAGE_SHARED));
-	} while (pte++, addr += PAGE_SIZE, addr != end);
-	return 0;
-}
-
-static long map_pmd_range(struct mm_struct *mm, pud_t *pud, unsigned long addr,
-			  unsigned long end, unsigned long start,
-			  struct sa_pagelist *pages)
-{
-	pmd_t *pmd;
-	unsigned long next;
-
-	pmd = my_pmd_alloc(mm, pud, addr);
-	if (!pmd)
-		return -ENOMEM;
-
-	do {
-		next = pmd_addr_end(addr, end);
-		if (map_pte_range(mm, pmd, addr, next, start, pages))
-			return -ENOMEM;
-	} while (pmd++, addr = next, addr != end);
-	return 0;
-}
-
-static long map_pud_range(struct mm_struct *mm, p4d_t *p4d, unsigned long addr,
-			  unsigned long end, unsigned long start,
-			  struct sa_pagelist *pages)
-{
-	pud_t *pud;
-	unsigned long next;
-
-	pud = my_pud_alloc(mm, p4d, addr);
-	if (!pud)
-		return -ENOMEM;
-
-	do {
-		next = pud_addr_end(addr, end);
-		if (map_pmd_range(mm, pud, addr, next, start, pages))
-			return -ENOMEM;
-	} while (pud++, addr = next, addr != end);
-	return 0;
-}
-
-static long map_p4d_range(struct mm_struct *mm, pgd_t *pgd, unsigned long addr,
-			  unsigned long end, unsigned long start,
-			  struct sa_pagelist *pages)
-{
-	p4d_t *p4d;
-	unsigned long next;
-
-	p4d = my_p4d_alloc(mm, pgd, addr);
-	if (!p4d)
-		return -ENOMEM;
-
-	do {
-		next = p4d_addr_end(addr, end);
-		if (map_pud_range(mm, p4d, addr, next, start, pages))
-			return -ENOMEM;
-	} while (p4d++, addr = next, addr != end);
-
-	return 0;
-}
-
-/**
- * map_range - Maps all the pages contained in `pages` to the range [addr, end).
- * @mm: mm_struct of the current process.
- * @addr: starting address of the range to map.
- * @end: ending address of the range to map.
- * @pages: list of pages to map.
- *
- * Context: Process context, assumes mmap_write_lock() is held.
- */
-static long map_range(struct mm_struct *mm, unsigned long addr,
-		      unsigned long end, struct sa_pagelist *pages)
-{
-	pgd_t *pgd;
-	unsigned long start;
-	unsigned long next;
-	long err;
-
-	mmap_assert_write_locked(mm);
-	err = 0;
-	start = addr;
-	pgd = pgd_offset(mm, addr);
-	do {
-		next = pgd_addr_end(addr, end);
-		err = map_p4d_range(mm, pgd, addr, next, start, pages);
-		if (err)
-			break;
-	} while (pgd++, addr = next, addr != end);
-
-	if (err < 0) {
-		sa_debug(SA_DEBUG_FAILED,
-			 "map_range [%lx-%lx) failed near %lx: %ld\n", start,
-			 end, addr, err);
-		// If something goes wrong, we don't remove the tables already allocated because they can be re-used in the future
-		// by another thread that recycles the virtual address (and by adjacent threads too)
-		unmap_range(mm, start, next, NULL);
-	}
-
-	sa_debug(SA_DEBUG_PGTABLE, "mapped [%lx-%lx)\n", start, end);
-	return err;
 }
 
 static bool valid_stack_base(unsigned long base)
@@ -789,7 +596,7 @@ static bool valid_stack_base(unsigned long base)
  * Context: Process context.
  * Returns 0 on success, < 0 otherwise.
  */
-long sa_alloc(uint64_t stack_base)
+long sa_alloc(u64 stack_base)
 {
 	unsigned long sp;
 	struct sa_allocator_desc *alloc;
@@ -896,27 +703,83 @@ long sa_detach(u64 stack_base)
 	return err;
 }
 
+static struct page *sa_lookup_shadow_page(struct mm_struct *mm,
+					  unsigned long shadow)
+{
+	struct page *page = NULL;
+	spinlock_t *ptl;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+	pgd = pgd_offset(mm, shadow);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return NULL;
+
+	p4d = p4d_offset(pgd, shadow);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return NULL;
+
+	pud = pud_offset(p4d, shadow);
+	if (pud_none(*pud) || pud_bad(*pud))
+		return NULL;
+
+	pmd = pmd_offset(pud, shadow);
+	if (pmd_none(*pmd) || pmd_bad(*pmd))
+		return NULL;
+
+	pte = my_pte_offset_map_lock(mm, pmd, shadow, &ptl);
+	if (!pte)
+		return NULL;
+
+	if (pte_present(ptep_get(pte))) {
+		page = pte_page(ptep_get(pte));
+		get_page(page);
+	}
+
+	pte_unmap_unlock(pte, ptl);
+	return page;
+}
+
+static unsigned long sa_free_shadow_area(struct mm_struct *mm)
+{
+	struct sa_gather g = { .mm = mm };
+
+	mmap_write_lock(mm);
+	my_free_pgd_range(&g, shdwstck_start, shdwstck_end);
+	sa_gather_finish(&g);
+	mmap_write_unlock(mm);
+	sa_debug(SA_DEBUG_PAGES, "freed %lu shadow pages\n", g.nr_freed);
+	return g.nr_freed;
+}
+
 /**
  * sa_fork - Creates a new shadow area mapping for the current calling thread by duplicating the parent thread's shadow stack.
  *
  * Context: Process context, it issues a TLB shootdown for the current process.
  * Returns 0 on success, <0 otherwise.
  */
-long sa_fork(uint64_t *stack_base)
+long sa_fork(u64 *stack_base)
 {
 	struct task_struct *parent;
 	struct mm_struct *mm, *parent_mm;
 	struct sa_allocator_desc *alloc, *pa;
 	struct sa_thread_desc *t, *pt;
-	int i, first;
+	u64 nr, shadow, sp;
+	struct page **ppages;
+	int i, first, from_parent, copied, extra;
 	long err;
-	unsigned long shadow_addr;
+
+	mm = current->mm;
+	if (!mm)
+		return -EINVAL;
 
 	rcu_read_lock();
 	parent = rcu_dereference(current->real_parent);
 	get_task_struct(parent);
 	rcu_read_unlock();
-
 	parent_mm = get_task_mm(parent);
 	put_task_struct(parent);
 	if (!parent_mm) {
@@ -928,12 +791,6 @@ long sa_fork(uint64_t *stack_base)
 	if (!pa) {
 		sa_user_error("no allocator for parent mm %p\n", parent_mm);
 		err = -ENOENT;
-		goto err_mmput;
-	}
-
-	mm = current->mm;
-	if (!mm) {
-		err = -EINVAL;
 		goto err_mmput;
 	}
 
@@ -951,37 +808,85 @@ long sa_fork(uint64_t *stack_base)
 		goto err_mmput;
 	}
 
-	t = &alloc->main;
-	err = gl_alloc_stack(&t->pagelist);
-	if (err)
+	nr = shdwstck_size >> PAGE_SHIFT;
+	shadow = shdwstck_addr(pt->stack_base);
+	ppages = kvcalloc(nr, sizeof(*ppages), GFP_KERNEL);
+	if (!ppages) {
+		err = -ENOMEM;
 		goto err_alloc;
+	}
 
-	first = (current_pt_regs()->sp - pt->stack_base) >> PAGE_SHIFT;
-	for (i = first; i < pt->pagelist->nr_pages; ++i)
-		copy_highpage(t->pagelist->pages[i], pt->pagelist->pages[i]);
+	mmap_read_lock(parent_mm);
+	for (i = 0; i < nr; ++i)
+		ppages[i] = sa_lookup_shadow_page(parent_mm,
+						  shadow + i * PAGE_SIZE);
 
-	bitmap_set(t->pagelist->dirty, first, t->pagelist->nr_pages - first);
+	mmap_read_unlock(parent_mm);
+	t = &alloc->main;
 	t->stack_base = pt->stack_base;
-	shadow_addr = shdwstck_addr(t->stack_base);
+	first = (current_pt_regs()->sp - pt->stack_base) >> PAGE_SHIFT;
+	err = 0;
+	from_parent = 0;
+	copied = 0;
 	mmap_write_lock(mm);
-	err = map_range(mm, shadow_addr, shadow_addr + shdwstck_size,
-			t->pagelist);
+	for (i = 0; i < nr && err >= 0; ++i) {
+		struct page *page;
+
+		if (!ppages[i])
+			continue;
+
+		page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!page) {
+			err = -ENOMEM;
+			break;
+		}
+
+		if (i >= first) {
+			copy_highpage(page, ppages[i]);
+			++copied;
+		}
+
+		err = sa_install_shadow_page(alloc, shadow + i * PAGE_SIZE,
+					     page);
+		if (err > 0)
+			from_parent += err;
+	}
+
+	extra = 0;
+	sp = current_pt_regs()->sp;
+	for (i = (ALIGN_DOWN(sp, PAGE_SIZE) - pt->stack_base) >> PAGE_SHIFT;
+	     i < nr && err >= 0; ++i) {
+		if (!ppages[i]) {
+			err = sa_install_shadow_page(
+				alloc, shadow + i * PAGE_SIZE, NULL);
+			if (err > 0)
+				extra += err;
+		}
+	}
+
 	mmap_write_unlock(mm);
-	if (err)
-		goto err_pages;
+	sa_debug(SA_DEBUG_PAGES,
+		 "fork: %d from parent (%d copied), %d extra below parent\n",
+		 from_parent, copied, extra);
+	for (i = 0; i < nr; ++i)
+		if (ppages[i])
+			put_page(ppages[i]);
+
+	kvfree(ppages);
+	if (err < 0)
+		goto err_shadow;
 
 	t->owner = get_pid(task_pid(current));
 	t->state = SA_OWNED;
 	*stack_base = t->stack_base;
 	sa_debug(SA_DEBUG_FORK,
 		 "copied stack %llx (%d pages) from parent mm %p\n",
-		 t->stack_base, pt->pagelist->nr_pages, parent_mm);
+		 t->stack_base, copied, parent_mm);
 	mmput(parent_mm);
 	return 0;
 
-err_pages:
-	gl_free(t->pagelist);
-	t->pagelist = NULL;
+err_shadow:
+	sa_free_shadow_area(mm);
 err_alloc:
 	alloc_unlink(alloc);
 	mmu_notifier_put(&alloc->notifier);
@@ -1005,9 +910,9 @@ long sa_pivot(u64 rsp, u64 new_stack_address, u64 *sa_delta)
 	struct sa_allocator_desc *alloc;
 	struct sa_thread_desc *thread;
 	struct vm_area_struct *old_area, *new_area;
-	unsigned long old_start, new_start, shadow_stack;
+	unsigned long old_start, new_start, sp, addr;
 	size_t old_len;
-	long delta, err;
+	long delta, err, n;
 	int i;
 
 	mm = current->mm;
@@ -1019,11 +924,6 @@ long sa_pivot(u64 rsp, u64 new_stack_address, u64 *sa_delta)
 		return PTR_ERR(alloc);
 
 	thread = &alloc->main;
-	err = gl_alloc_stack(&thread->pagelist);
-	if (err) {
-		goto err_alloc;
-	}
-
 	mmap_write_lock(mm);
 	old_area = find_vma(mm, rsp);
 	if (!old_area || old_area->vm_start > rsp) {
@@ -1033,8 +933,10 @@ long sa_pivot(u64 rsp, u64 new_stack_address, u64 *sa_delta)
 	}
 
 	new_area = find_vma(mm, new_stack_address);
-	if (!new_area || new_area->vm_start > new_stack_address) {
-		sa_user_error("no vma for new stack %llx\n", new_stack_address);
+	if (!new_area || new_area->vm_start > new_stack_address ||
+	    new_area->vm_ops != &sa_stack_vm_ops) {
+		sa_user_error("no vma for new stack %llx or invalid mapping\n",
+			      new_stack_address);
 		err = -EINVAL;
 		goto err_unlock;
 	}
@@ -1048,17 +950,29 @@ long sa_pivot(u64 rsp, u64 new_stack_address, u64 *sa_delta)
 		goto err_unlock;
 	}
 
-	shadow_stack = shdwstck_addr(new_start);
-	err = map_range(mm, shadow_stack, shadow_stack + shdwstck_size,
-			thread->pagelist);
-	if (err)
+	sp = current_pt_regs()->sp;
+	if (sp < new_start || sp >= new_start + shdwstck_size) {
+		err = -EINVAL;
 		goto err_unlock;
+	}
 
+	n = 0;
+	for (addr = ALIGN_DOWN(sp, PAGE_SIZE); addr < new_start + shdwstck_size;
+	     addr += PAGE_SIZE) {
+		err = sa_install_shadow_page(alloc, shdwstck_addr(addr), NULL);
+		if (err < 0)
+			goto err_unlock;
+
+		n += err;
+	}
+
+	sa_debug(SA_DEBUG_PAGES, "pivot: %ld shadow pages installed\n", n);
+	old_start = old_area->vm_start;
+	old_len = old_area->vm_end - old_area->vm_start;
+	mmap_write_unlock(mm);
 	thread->stack_base = new_start;
 	thread->owner = get_pid(task_pid(current));
 	thread->state = SA_OWNED;
-	old_start = old_area->vm_start;
-	old_len = old_area->vm_end - old_area->vm_start;
 	delta = new_stack_address - rsp;
 	spin_lock(&mm->arg_lock);
 	mm->start_stack = new_start;
@@ -1077,57 +991,22 @@ long sa_pivot(u64 rsp, u64 new_stack_address, u64 *sa_delta)
 	}
 
 	spin_unlock(&mm->arg_lock);
-	vm_flags_clear(old_area, VM_GROWSDOWN);
-	vm_flags_set(new_area, VM_GROWSDOWN);
-	mmap_write_unlock(mm);
-	sa_debug(SA_DEBUG_PIVOT,
-		 "pivot: [%lx-%lx) -> [%lx-%lx), delta %ld, shadow %lx\n",
-		 old_start, old_start + old_len, new_start,
-		 new_start + shdwstck_size, delta, shadow_stack);
 	vm_munmap(old_start, old_len);
 	*sa_delta = shdwstck_delta;
-	return err;
+	sa_debug(SA_DEBUG_PIVOT,
+		 "pivot: [%lx-%lx) -> [%lx-%lx), delta %ld, shadow %llx\n",
+		 old_start, old_start + old_len, new_start,
+		 new_start + shdwstck_size, delta,
+		 shdwstck_addr(new_stack_address));
+	return 0;
 
 err_unlock:
 	mmap_write_unlock(mm);
-	gl_free(thread->pagelist);
-	thread->pagelist = NULL;
-err_alloc:
-	sa_debug(SA_DEBUG_FAILED, "failer with error %ld\n", err);
+	sa_free_shadow_area(mm);
+	sa_debug(SA_DEBUG_FAILED, "failed with error %ld\n", err);
 	alloc_unlink(alloc);
 	mmu_notifier_put(&alloc->notifier);
 	return err;
-}
-
-static void sa_collect_dirty(struct mm_struct *mm, struct sa_thread_desc *t)
-{
-	unsigned long shadow;
-
-	if (!t->pagelist)
-		return;
-
-	shadow = shdwstck_addr(t->stack_base);
-	unmap_range(mm, shadow, shadow + shdwstck_size, t->pagelist);
-}
-
-static void sa_free_shadow_tables(struct mm_struct *mm,
-				  struct sa_allocator_desc *alloc)
-{
-	struct sa_thread_desc *t;
-	unsigned long tid;
-	struct sa_tlb tlb = { .mm = mm,
-			      .batch = (struct sa_batch *)get_zeroed_page(
-				      GFP_KERNEL) };
-
-	mmap_write_lock(mm);
-	sa_collect_dirty(mm, &alloc->main);
-	xa_for_each(&alloc->threads, tid, t)
-		sa_collect_dirty(mm, t);
-
-	my_free_pgd_range(&tlb, shdwstck_start, shdwstck_end);
-	mmap_write_unlock(mm);
-	sa_debug(SA_DEBUG_TLB, "tlb finish [%lx-%lx) mm %p\n", shdwstck_start,
-		 shdwstck_end, mm);
 }
 
 void sa_mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
@@ -1141,13 +1020,12 @@ void sa_mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
 	sa_debug(SA_DEBUG_ALLOCATOR, "releasing allocator %p (mm %p)\n", alloc,
 		 mm);
 	alloc_unlink(alloc);
-	sa_free_shadow_tables(mm, alloc);
-	if (alloc->main.pagelist)
-		gl_free(alloc->main.pagelist);
-
+	atomic_long_add(sa_free_shadow_area(mm), &alloc->shadow_freed);
+	sa_debug(SA_DEBUG_PAGES, "mm %p: installed %ld, freed %ld\n", mm,
+		 atomic_long_read(&alloc->shadow_installed),
+		 atomic_long_read(&alloc->shadow_freed));
 	put_pid(alloc->main.owner);
 	xa_for_each(&alloc->threads, tid, t) {
-		gl_free(t->pagelist);
 		put_pid(t->owner);
 		kfree(t);
 		nr++;
@@ -1168,13 +1046,15 @@ void sa_mn_free(struct mmu_notifier *mn)
 	module_put(THIS_MODULE);
 }
 
-long sa_prepare(uint64_t stack_base, bool detached)
+long sa_prepare(u64 stack_base, bool detached)
 {
 	struct sa_allocator_desc *alloc;
 	struct sa_thread_desc *t;
-	unsigned long id, shadow;
+	unsigned long id;
 	long err;
 	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	bool ok;
 
 	mm = current->mm;
 	if (!mm)
@@ -1196,52 +1076,45 @@ long sa_prepare(uint64_t stack_base, bool detached)
 		return -EBUSY;
 	}
 
-	id = shdwstck_idx(stack_base);
-	err = xa_insert(&alloc->threads, id, NULL, GFP_KERNEL);
-	if (err == -EBUSY) {
-		sa_user_error("slot %lu already in use\n", id);
-		return err;
-	}
-
-	if (err) {
-		sa_debug(SA_DEBUG_FAILED, "xa_insert slot %lu failed: %ld\n",
-			 id, err);
-		return err;
-	}
+	mmap_read_lock(mm);
+	// We have to make sure that the VMA containing stack_base is backed by this module
+	vma = find_vma(mm, stack_base);
+	ok = vma && vma->vm_start == stack_base &&
+	     vma->vm_end == stack_base + shdwstck_size &&
+	     vma->vm_ops == &sa_stack_vm_ops;
+	mmap_read_unlock(mm);
+	if (!ok)
+		return -EINVAL;
 
 	t = kzalloc_obj(struct sa_thread_desc, GFP_KERNEL);
 	if (!t) {
 		sa_debug(SA_DEBUG_FAILED, "cannot allocate descriptor\n");
-		err = -ENOMEM;
-		goto release;
+		return -ENOMEM;
 	}
 
 	t->stack_base = stack_base;
 	t->state = SA_PREPARED;
 	t->detached = detached;
-	err = gl_alloc_stack(&t->pagelist);
-	if (err)
+	id = shdwstck_idx(stack_base);
+	err = xa_insert(&alloc->threads, id, t, GFP_KERNEL);
+	if (err == -EBUSY) {
+		sa_user_error("slot %lu already in use\n", id);
 		goto free_desc;
+	}
 
-	shadow = shdwstck_addr(stack_base);
-	mmap_write_lock(mm);
-	err = map_range(mm, shadow, shadow + shdwstck_size, t->pagelist);
-	mmap_write_unlock(mm);
-	if (err)
-		goto free_pages;
+	if (err) {
+		sa_debug(SA_DEBUG_FAILED, "xa_insert slot %lu failed: %ld\n",
+			 id, err);
+		goto free_desc;
+	}
 
-	xa_store(&alloc->threads, id, t, GFP_KERNEL);
 	sa_debug(SA_DEBUG_SLOT,
-		 "slot %lu prepared (base %llx, shadow %lx, detached %d)\n", id,
-		 stack_base, shadow, detached);
+		 "slot %lu prepared (base %llx, shadow %llx, detached %d)\n",
+		 id, stack_base, shdwstck_addr(stack_base), detached);
 	return 0;
 
-free_pages:
-	gl_free(t->pagelist);
 free_desc:
 	kfree(t);
-release:
-	xa_release(&alloc->threads, id);
 	return err;
 }
 
@@ -1264,34 +1137,33 @@ static inline bool owner_gone(struct pid *owner)
 	return gone;
 }
 
-static void sa_desc_release_list(struct list_head *list)
+static void sa_desc_release_list(struct sa_allocator_desc *alloc,
+				 struct list_head *list)
 {
-	struct mm_struct *mm;
+	struct sa_gather g = { .mm = alloc->mm };
 	struct sa_thread_desc *t, *tmp;
 
 	if (list_empty(list))
 		return;
 
-	mm = current->mm;
-	if (WARN_ON_ONCE(!mm))
-		return;
-
-	mmap_write_lock(mm);
+	mmap_write_lock(alloc->mm);
 	list_for_each_entry(t, list, list) {
 		unsigned long shadow = shdwstck_addr(t->stack_base);
 
-		unmap_range(mm, shadow, shadow + shdwstck_size, t->pagelist);
+		unmap_range(&g, shadow, shadow + shdwstck_size);
 	}
+	sa_gather_finish(&g);
+	mmap_write_unlock(alloc->mm);
+	atomic_long_add(g.nr_freed, &alloc->shadow_freed);
+	sa_debug(SA_DEBUG_PAGES, "freed %lu shadow pages\n", g.nr_freed);
 
-	mmap_write_unlock(mm);
 	list_for_each_entry_safe(t, tmp, list, list) {
 		put_pid(t->owner);
-		gl_free(t->pagelist);
 		kfree(t);
 	}
 }
 
-long sa_reclaim(uint64_t stack_base)
+long sa_reclaim(u64 stack_base)
 {
 	struct mm_struct *mm;
 	struct sa_allocator_desc *alloc;
@@ -1345,7 +1217,7 @@ long sa_reclaim(uint64_t stack_base)
 		return err;
 	}
 
-	sa_desc_release_list(&dead);
+	sa_desc_release_list(alloc, &dead);
 	sa_debug(SA_DEBUG_RECLAIM, "slot %lu reclaimed\n", index);
 	return err;
 }
@@ -1396,7 +1268,7 @@ long sa_reclaim_dead(u64 __user *reclaimed, unsigned cap)
 	}
 
 	xa_unlock(&alloc->threads);
-	sa_desc_release_list(&dead);
+	sa_desc_release_list(alloc, &dead);
 	sa_debug(SA_DEBUG_RECLAIM, "reclaimed %u detached slots (cap %u)\n", n,
 		 cap);
 	ret = n;
@@ -1454,22 +1326,47 @@ long sa_unprepare(u64 stack_base)
 		return err;
 	}
 
-	sa_desc_release_list(&dead);
+	sa_desc_release_list(alloc, &dead);
 	sa_debug(SA_DEBUG_SLOT, "slot %lu unprepared\n", index);
 	return err;
 }
 
-void vma_free(void)
+static bool sa_stack_range_ok(unsigned long start, unsigned long end)
 {
-	LIST_HEAD(old_list);
-	struct sa_pagelist *it;
-	struct sa_pagelist *tmp;
-
-	spin_lock(&gl_lock);
-	list_splice_init(&gl_sa, &old_list);
-	gl_size = 0;
-	spin_unlock(&gl_lock);
-	list_for_each_entry_safe(it, tmp, &old_list, list) {
-		sa_pagelist_free(it);
-	}
+	return valid_stack_base(start) && (end - start) == shdwstck_size;
 }
+
+#if SA_HAVE_MMAP_PREPARE
+int sa_mmap_prepare(struct vm_area_desc *desc)
+{
+	bool cow;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+	cow = vma_desc_is_cow_mapping(desc);
+#else
+	cow = is_cow_mapping(desc->vm_flags);
+#endif
+	if (!cow || !sa_stack_range_ok(desc->start, desc->end))
+		return -EINVAL;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+	vma_desc_set_flags(desc, VMA_DONTEXPAND_BIT);
+#else
+	desc->vm_flags |= VM_DONTEXPAND;
+#endif
+	desc->vm_ops = &sa_stack_vm_ops;
+	sa_debug(SA_DEBUG_PAGES, "mmap stack [%lx-%lx)\n", desc->start,
+		 desc->end);
+	return 0;
+}
+#else
+int sa_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	if (!is_cow_mapping(vma->vm_flags) ||
+	    !sa_stack_range_ok(vma->vm_start, vma->vm_end))
+		return -EINVAL;
+
+	vm_flags_set(vma, VM_DONTEXPAND);
+	vma->vm_ops = &sa_stack_vm_ops;
+	return 0;
+}
+#endif

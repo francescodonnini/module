@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "pt_bindings.h"
-#include "api.h"
+#include "core.h"
 #include <linux/kprobes.h>
 
 __p4d_alloc_t __p4d_alloc_bnd;

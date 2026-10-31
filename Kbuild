@@ -1,7 +1,7 @@
 obj-m += shdwstck_runtime.o shdwstck_debug.o
 
 shdwstck_runtime-objs := main.o \
-                            core/api.o \
+                            core/core.o \
                             core/device.o \
                             core/ioctl.o \
 							core/pt_bindings.o
